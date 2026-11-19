@@ -6,6 +6,34 @@ total activity.
 
 Keys: `s` toggles the stats bar, `l` the legend, `w` the wireframe overlay; `q` / `Esc` / `Ctrl-C` quit.
 
+## Web preview
+
+`web/` builds the same renderer for the browser (WebAssembly, single thread), driven by a
+simulated sensor sequence instead of the OS, so it behaves as if it ran on a machine whose load
+keeps changing. Everything after the sensors is the real pipeline: smoothing, rolling peaks,
+activity score, frame-rate curve, adaptive quality, legend and wireframe.
+
+```powershell
+rustup target add wasm32-unknown-unknown   # once
+.\web\build.ps1                            # -> web\dist\index.html (wasm inlined, ~720 KB)
+```
+
+Open `web\dist\index.html` straight from disk, or serve it with `.\web\serve.ps1` (http://localhost:8765).
+No wasm-bindgen, npm or other tooling is needed: the page talks to a plain `extern "C"` API.
+
+The settings panel (`g`) covers every option and shows each one's scope:
+
+| Tag | When it takes effect |
+|---|---|
+| **instant** | simulated load: profile (`cycle`, `bursts`, `ramp`, `steps`, `idle`, `stress`, `manual`), speed, manual level, seed |
+| **live** | display, legend & wireframe, frame rate, rendering, background, animation — applied as you change them |
+| **on Apply** | metrics, solids, rings, camera, smoothing, sensor rate — **Apply & restart** rebuilds the scene |
+
+Switch the panel to **On Apply only** to hold every change until Apply. Changed-but-not-applied
+settings are highlighted, and the panel shows the equivalent desktop command and `config.toml`.
+The simulated machine has adapters `Ethernet`, `Wi-Fi`, `vEthernet` and disks `C:\`, `D:\`, `E:\`.
+Browsers cap drawing at the display's refresh rate and throttle hidden tabs.
+
 ## Launch parameters
 
 ```
@@ -30,6 +58,7 @@ platomon [OPTIONS]
 | `--spp` | `N` (1–64) | 2 |
 | `--bounces` | `N` (0–8) | 2 |
 | `--fps-min` / `--fps-max` | `FPS` | 5 / 150 |
+| `--fps-invert` | flag: idle runs at `--fps-max`, full load at `--fps-min` | off |
 | `--ramp` | `STR`, darkest first (any length ≥ 2) | `" .,:;-~=+*ox#%&@"` (16 levels) |
 | `--char-aspect` | cell width ÷ height | 0.5 |
 | **Display ratio** | | |
@@ -243,6 +272,7 @@ platomon --ramp " ░▒▓█"                                                #
 platomon --spp 4 --bounces 3 --fps-max 60                              # smoother, slower, capped at 60 fps
 platomon --spp 1 --bounces 1 --fps-max 30                              # light on CPU
 platomon --fps-min 30 --fps-max 30                                     # constant 30 fps, ignore activity
+platomon --fps-invert --fps-max 60                                     # fast when idle, slows to 5 fps under load
 ```
 
 **Snapshots (no terminal needed)**

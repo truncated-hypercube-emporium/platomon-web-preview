@@ -12,4 +12,5 @@ pub mod metrics;
 pub mod overlay;
 pub mod render;
 pub mod scene;
+pub mod sim;
 pub mod ui;

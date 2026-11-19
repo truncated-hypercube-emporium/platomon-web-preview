@@ -84,6 +84,9 @@ struct Cli {
     /// Frame-rate ceiling (full load).
     #[arg(long, value_name = "FPS")]
     fps_max: Option<f32>,
+    /// Invert the load/fps relationship: idle runs at --fps-max, full load at --fps-min.
+    #[arg(long)]
+    fps_invert: bool,
     /// Glyph ramp, darkest first.
     #[arg(long, value_name = "STR")]
     ramp: Option<String>,
@@ -186,6 +189,9 @@ fn apply_cli(cfg: &mut Config, cli: &Cli) -> Result<(), String> {
     }
     if cli.wireframe {
         cfg.wireframe = true;
+    }
+    if cli.fps_invert {
+        cfg.fps_invert = true;
     }
     if let Some(s) = &cli.bg_scroll {
         cfg.bg_scroll = parse_vec2(s).map_err(|e| format!("--bg-scroll: {e}"))?;
@@ -566,7 +572,7 @@ fn run(cfg: &Config, slots: &[SlotSpec], ratio: Option<f32>, mut perf: Option<Pe
     let mut scene = Scene::new(&layouts(slots), &anim, &camera_params(cfg)).with_ground(&cfg.ground_params());
     let mut metrics = MetricsState::new(cfg, &specs);
     let weights = metrics.weights(&cfg.weights);
-    let mut fps = FrameClock::new(cfg.fps_min, cfg.fps_max, cfg.fps_curve, cfg.fps_slew);
+    let mut fps = FrameClock::new(cfg.fps_min, cfg.fps_max, cfg.fps_curve, cfg.fps_slew).inverted(cfg.fps_invert);
     let mut renderer = Renderer::new();
     let mut governor = QualityGovernor::default();
     let mut frame = String::with_capacity(cols as usize * rows as usize * 2 + 1024);

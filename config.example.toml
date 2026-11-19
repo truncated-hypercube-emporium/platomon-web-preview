@@ -9,6 +9,7 @@ fps_min = 5.0
 fps_max = 150.0
 fps_curve = "sqrt"
 fps_slew = 60.0
+fps_invert = false
 spp = 2
 bounces = 2
 max_steps = 64

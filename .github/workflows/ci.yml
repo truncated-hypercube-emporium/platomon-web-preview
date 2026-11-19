@@ -64,6 +64,24 @@ jobs:
             target/release/platomon.exe
           if-no-files-found: ignore
 
+  web:
+    name: web (wasm32 build + tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p platomon-web
+      - run: cargo clippy -p platomon-web -p platomon --lib --target wasm32-unknown-unknown -- -D warnings
+      - run: pwsh ./web/build.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: platomon-web
+          path: web/dist/index.html
+
   bench:
     name: bench (ubuntu, compile + quick run)
     runs-on: ubuntu-latest

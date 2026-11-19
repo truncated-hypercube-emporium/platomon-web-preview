@@ -1,0 +1,599 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>platomon web preview</title>
+<style>
+  :root {
+    --bg: #0b0d10;
+    --fg: #d9dee4;
+    --panel: rgba(20, 23, 28, 0.92);
+    --panel-solid: #14171c;
+    --line: #2a2f37;
+    --muted: #8b939e;
+    --accent: #7cc4ff;
+    --warn: #ffb454;
+    --err: #ff6b6b;
+    --ok: #7bd88f;
+    --input: #1c2027;
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); overflow: hidden;
+    font: 13px/1.35 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  #stage { position: fixed; inset: 0; overflow: hidden; }
+  #screen { margin: 0; padding: 0; white-space: pre; color: var(--fg); background: var(--bg);
+    font-family: Consolas, "Cascadia Mono", Menlo, "DejaVu Sans Mono", monospace; line-height: 1;
+    position: absolute; top: 0; left: 0; user-select: none; }
+  #probe { position: absolute; visibility: hidden; white-space: pre; line-height: 1;
+    font-family: Consolas, "Cascadia Mono", Menlo, "DejaVu Sans Mono", monospace; }
+  #toggle { position: fixed; top: 10px; right: 10px; z-index: 3; background: var(--panel-solid); color: var(--fg);
+    border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px; cursor: pointer; font: inherit; }
+  #toggle:hover { border-color: var(--accent); }
+  #panel { position: fixed; top: 0; right: 0; bottom: 0; width: min(380px, 100vw); z-index: 2; background: var(--panel);
+    backdrop-filter: blur(6px); border-left: 1px solid var(--line); display: flex; flex-direction: column;
+    transform: translateX(0); transition: transform .18s ease; }
+  #panel.hidden { transform: translateX(100%); }
+  #panel header { padding: 12px 14px 8px; border-bottom: 1px solid var(--line); }
+  #panel h1 { font-size: 15px; margin: 0 0 2px; font-weight: 600; letter-spacing: .02em; }
+  #panel .sub { color: var(--muted); font-size: 12px; }
+  #scroll { overflow-y: auto; flex: 1; padding: 4px 0 12px; }
+  details { border-bottom: 1px solid var(--line); }
+  summary { cursor: pointer; padding: 9px 14px; font-weight: 600; list-style: none; display: flex; align-items: center; gap: 8px; }
+  summary::-webkit-details-marker { display: none; }
+  summary::before { content: "▸"; color: var(--muted); width: 10px; }
+  details[open] summary::before { content: "▾"; }
+  summary .tag { margin-left: auto; font-size: 11px; font-weight: 500; padding: 1px 6px; border-radius: 4px; border: 1px solid var(--line); color: var(--muted); }
+  summary .tag.live { color: var(--ok); border-color: #2f5a3a; }
+  summary .tag.restart { color: var(--warn); border-color: #5e4a2a; }
+  .body { padding: 2px 14px 12px; display: grid; gap: 8px; }
+  .row { display: grid; grid-template-columns: 118px 1fr 52px; align-items: center; gap: 8px; }
+  .row.pending label { color: var(--warn); }
+  .row label { color: #c3c9d1; font-size: 12px; }
+  .row output { text-align: right; color: var(--muted); font-variant-numeric: tabular-nums; font-size: 12px; }
+  input[type=range] { width: 100%; accent-color: var(--accent); }
+  select, input[type=text], input[type=number] { width: 100%; background: var(--input); color: var(--fg); border: 1px solid var(--line);
+    border-radius: 4px; padding: 3px 6px; font: inherit; font-size: 12px; }
+  input[type=checkbox] { accent-color: var(--accent); width: 15px; height: 15px; justify-self: start; }
+  input:disabled, select:disabled { opacity: .45; }
+  table.metrics { width: 100%; border-collapse: collapse; font-size: 12px; }
+  table.metrics th { text-align: left; color: var(--muted); font-weight: 500; padding: 2px 4px; }
+  table.metrics td { padding: 2px 4px; }
+  table.metrics tr.pending td:nth-child(2) { color: var(--warn); }
+  table.metrics select { padding: 2px 3px; }
+  .buttons { position: sticky; bottom: 0; display: grid; grid-template-columns: 1fr 1fr; gap: 8px; padding: 10px 14px;
+    border-top: 1px solid var(--line); background: var(--panel-solid); }
+  button { background: var(--input); color: var(--fg); border: 1px solid var(--line); border-radius: 5px; padding: 7px 10px; cursor: pointer; font: inherit; }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: #1d3550; border-color: #2f5a85; }
+  button.primary.has-pending { background: #4a3514; border-color: var(--warn); color: #ffe3b8; }
+  .wide { grid-column: 1 / -1; }
+  #status { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; line-height: 1.5; }
+  #status b { color: var(--fg); font-weight: 600; }
+  #msg { font-size: 12px; color: var(--err); white-space: pre-wrap; }
+  #msg.ok { color: var(--ok); }
+  canvas#graph { width: 100%; height: 70px; display: block; background: #0f1216; border: 1px solid var(--line); border-radius: 4px; }
+  .legend-keys { display: flex; gap: 12px; font-size: 11px; color: var(--muted); }
+  .legend-keys i { display: inline-block; width: 10px; height: 3px; vertical-align: middle; margin-right: 4px; }
+  textarea { width: 100%; height: 86px; resize: vertical; background: var(--input); color: var(--fg); border: 1px solid var(--line);
+    border-radius: 4px; padding: 6px; font: 11px/1.4 Consolas, Menlo, monospace; }
+  .hint { color: var(--muted); font-size: 11px; }
+  kbd { border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 3px; padding: 0 4px; font-size: 11px; background: var(--input); }
+  .seg { display: flex; gap: 6px; }
+  .seg button { flex: 1; padding: 4px 6px; font-size: 12px; }
+  .seg button.on { border-color: var(--accent); color: var(--accent); }
+  @media (max-width: 480px) { .row { grid-template-columns: 100px 1fr 44px; } }
+</style>
+</head>
+<body>
+<div id="stage"><pre id="screen">loading…</pre><span id="probe"></span></div>
+<button id="toggle" title="Show or hide settings (g)">⚙ Settings</button>
+
+<aside id="panel">
+  <header>
+    <h1>platomon · web preview</h1>
+    <div class="sub">Simulated sensors, real renderer (Rust → WebAssembly, single thread).</div>
+  </header>
+  <div id="scroll">
+    <div class="body" style="padding-top:10px">
+      <div id="status">starting…</div>
+      <canvas id="graph" width="700" height="140"></canvas>
+      <div class="legend-keys">
+        <span><i style="background:#ffb454"></i>sim load</span>
+        <span><i style="background:#7cc4ff"></i>activity</span>
+        <span><i style="background:#7bd88f"></i>target fps</span>
+      </div>
+      <div class="row">
+        <label>Apply mode</label>
+        <div class="seg wide" style="grid-column: 2 / 4">
+          <button id="mode-live" class="on" title="Live settings take effect as you change them">Live</button>
+          <button id="mode-manual" title="Every change waits for Apply">On Apply only</button>
+        </div>
+      </div>
+      <div id="msg"></div>
+    </div>
+    <div id="sections"></div>
+    <details>
+      <summary>Equivalent desktop command</summary>
+      <div class="body">
+        <div class="hint">PowerShell syntax. Settings without a flag go in <code>config.toml</code> (below).</div>
+        <textarea id="cli" readonly></textarea>
+        <button id="copy-cli">Copy command</button>
+        <textarea id="toml" readonly></textarea>
+        <button id="copy-toml">Copy config.toml</button>
+      </div>
+    </details>
+    <div class="body" style="padding-top:10px">
+      <div class="hint">Keys: <kbd>g</kbd> settings · <kbd>s</kbd> stats · <kbd>l</kbd> legend · <kbd>w</kbd> wireframe · <kbd>space</kbd> pause</div>
+    </div>
+  </div>
+  <div class="buttons">
+    <button id="apply" class="primary">Apply &amp; restart</button>
+    <button id="reset">Reset defaults</button>
+  </div>
+</aside>
+
+<script>
+"use strict";
+const WASM_B64 = "__WASM_BASE64__";
+
+// ------------------------------------------------------------------ catalogue
+const SOLIDS = ["tetrahedron","cube","octahedron","dodecahedron","icosahedron","truncated-tetrahedron","cuboctahedron",
+  "truncated-cube","truncated-octahedron","rhombicuboctahedron","icosidodecahedron","truncated-icosahedron",
+  "truncated-dodecahedron","rhombic-dodecahedron","rhombic-triacontahedron"];
+const PROFILES = ["cycle","bursts","ramp","steps","idle","stress","manual"];
+const METRICS = [
+  { key: "cpu", def: "icosahedron", on: true },
+  { key: "ram", def: "cube", on: true },
+  { key: "disk", def: "octahedron", on: true },
+  { key: "net", def: "tetrahedron", on: true },
+  { key: "gpu", def: "dodecahedron", on: true },
+  { key: "nic", def: "rhombic-dodecahedron", on: false, note: "busiest adapter" },
+  { key: "nic:Ethernet", def: "rhombic-dodecahedron", on: false },
+  { key: "nic:Wi-Fi", def: "rhombic-dodecahedron", on: false },
+  { key: "nic:vEthernet", def: "rhombic-dodecahedron", on: false },
+  { key: "disk-dev", def: "truncated-cube", on: false, note: "busiest disk" },
+  { key: "disk-dev:C:\\", def: "truncated-cube", on: false },
+  { key: "disk-dev:D:\\", def: "truncated-cube", on: false },
+  { key: "disk-dev:E:\\", def: "truncated-cube", on: false },
+];
+const RAMPS = { default: " .,:;-~=+*ox#%&@", classic: " .:-=+*#%@", blocks: " ░▒▓█", dots: " ·:∙•●" };
+const ASPECTS = ["fill","vga","svga","xga","sxga","wxga","hd","wxga+","fhd","wuxga","qhd","uwfhd","uwqhd","uhd","square","21:9","32:9"];
+
+// kind: sim (instant, no restart), view (page only), live (configure restart=0), restart (needs Apply)
+// flag: desktop CLI flag; def: program default (for the CLI line); init: web starting value
+const SECTIONS = [
+  { title: "Simulated load", kind: "sim", open: true, fields: [
+    { id: "profile", label: "Profile", type: "select", options: PROFILES, init: "cycle" },
+    { id: "speed", label: "Speed", type: "range", min: 0.25, max: 8, step: 0.25, init: 1, fmt: v => v + "×" },
+    { id: "manual", label: "Manual load", type: "range", min: 0, max: 1, step: 0.01, init: 0.5, fmt: v => Math.round(v * 100) + "%" },
+    { id: "simseed", label: "Seed", type: "number", min: 0, max: 99999, step: 1, init: 1 },
+  ]},
+  { title: "Display", kind: "live", open: true, fields: [
+    { id: "font", label: "Font size", type: "range", min: 5, max: 24, step: 1, init: 12, kind: "view", fmt: v => v + " px" },
+    { id: "char_auto", label: "Auto cell aspect", type: "check", init: true, kind: "view" },
+    { id: "char_aspect", label: "Cell aspect", type: "range", min: 0.3, max: 1, step: 0.01, init: 0.5, def: 0.5, flag: "--char-aspect" },
+    { id: "aspect", label: "Aspect", type: "select", options: ASPECTS, init: "fill", def: "fill", flag: "--aspect" },
+    { id: "aspect_mode", label: "Aspect mode", type: "select", options: ["letterbox","crop"], init: "letterbox", def: "letterbox", flag: "--aspect-mode" },
+    { id: "ramp_preset", label: "Glyph ramp", type: "select", options: [...Object.keys(RAMPS), "custom"], init: "default", kind: "view" },
+    { id: "ramp", label: "Ramp chars", type: "text", init: RAMPS.default, def: RAMPS.default, flag: "--ramp" },
+    { id: "exposure", label: "Exposure", type: "range", min: 0.2, max: 4, step: 0.05, init: 1, def: 1 },
+    { id: "show_stats", label: "Stats bar", type: "check", init: true, def: false, flag: "--stats" },
+  ]},
+  { title: "Legend & wireframe", kind: "live", open: true, fields: [
+    { id: "legend", label: "Legend", type: "check", init: true, def: false, flag: "--legend" },
+    { id: "legend_size", label: "Legend size", type: "range", min: 1, max: 5, step: 1, init: 2, def: 2, flag: "--legend-size" },
+    { id: "legend_opacity", label: "Legend opacity", type: "range", min: 0, max: 1, step: 0.05, init: 0.85, def: 0.85, flag: "--legend-opacity" },
+    { id: "legend_pos", label: "Legend corner", type: "select", options: ["top-left","top-right","bottom-left","bottom-right"], init: "top-left", def: "top-left", flag: "--legend-pos" },
+    { id: "wireframe", label: "Wireframe", type: "check", init: false, def: false, flag: "--wireframe" },
+  ]},
+  { title: "Frame rate", kind: "live", fields: [
+    { id: "fps_min", label: "Min fps (idle)", type: "range", min: 1, max: 60, step: 1, init: 5, def: 5, flag: "--fps-min" },
+    { id: "fps_max", label: "Max fps (load)", type: "range", min: 5, max: 240, step: 5, init: 150, def: 150, flag: "--fps-max" },
+    { id: "fps_invert", label: "Invert", type: "check", init: false, def: false, flag: "--fps-invert" },
+    { id: "fps_curve", label: "Curve", type: "select", options: ["sqrt","linear"], init: "sqrt", def: "sqrt" },
+    { id: "fps_slew", label: "Slew (fps/s)", type: "range", min: 5, max: 500, step: 5, init: 60, def: 60 },
+  ]},
+  { title: "Rendering", kind: "live", fields: [
+    { id: "spp", label: "Samples/pixel", type: "range", min: 1, max: 8, step: 1, init: 2, def: 2, flag: "--spp" },
+    { id: "bounces", label: "Bounces", type: "range", min: 0, max: 4, step: 1, init: 2, def: 2, flag: "--bounces" },
+    { id: "max_steps", label: "March steps", type: "range", min: 16, max: 256, step: 8, init: 64, def: 64 },
+    { id: "adaptive_quality", label: "Adaptive quality", type: "check", init: true, def: true },
+  ]},
+  { title: "Background", kind: "live", fields: [
+    { id: "bg_lum", label: "Luminosity", type: "range", min: 0, max: 10, step: 0.5, init: 5, def: 5, flag: "--bg-lum", fmt: v => v == 0 ? "off" : v },
+    { id: "bg_pattern", label: "Pattern", type: "select", options: ["solid","checker","diamond","brick","triangles","hex","radial"], init: "solid", def: "solid", flag: "--bg-pattern" },
+    { id: "bg_contrast", label: "Contrast", type: "range", min: 0, max: 1, step: 0.05, init: 0.5, def: 0.5, flag: "--bg-contrast" },
+    { id: "bg_scale", label: "Tile size", type: "range", min: 0.2, max: 5, step: 0.1, init: 1, def: 1, flag: "--bg-scale" },
+    { id: "bg_scroll_x", label: "Scroll X /s", type: "range", min: -2, max: 2, step: 0.1, init: 0, def: 0 },
+    { id: "bg_scroll_z", label: "Scroll Z /s", type: "range", min: -2, max: 2, step: 0.1, init: 0, def: 0 },
+    { id: "bg_sway", label: "Sway radius", type: "range", min: 0, max: 3, step: 0.1, init: 0, def: 0, flag: "--bg-sway" },
+    { id: "bg_sway_period", label: "Sway period", type: "range", min: 1, max: 60, step: 1, init: 10, def: 10, flag: "--bg-sway-period", fmt: v => v + " s" },
+    { id: "bg_rotate", label: "Rotate", type: "select", options: ["off","cw","ccw"], init: "off", def: "off", flag: "--bg-rotate" },
+    { id: "bg_rotate_period", label: "Rotate period", type: "range", min: 2, max: 120, step: 1, init: 60, def: 60, flag: "--bg-rotate-period", fmt: v => v + " s" },
+  ]},
+  { title: "Animation", kind: "live", fields: [
+    { id: "min_scale", label: "Min scale", type: "range", min: 0.05, max: 1, step: 0.05, init: 0.45, def: 0.45 },
+    { id: "max_scale", label: "Max scale", type: "range", min: 0.1, max: 1, step: 0.05, init: 1, def: 1 },
+    { id: "idle_spin", label: "Idle spin", type: "range", min: 0, max: 2, step: 0.05, init: 0.15, def: 0.15, fmt: v => v + " r/s" },
+    { id: "max_spin", label: "Max spin", type: "range", min: 0, max: 8, step: 0.1, init: 3, def: 3, fmt: v => v + " r/s" },
+  ]},
+  { title: "Scene & camera", kind: "restart", fields: [
+    { id: "metrics", type: "metrics" },
+    { id: "camera", label: "Camera", type: "select", options: ["static","orbit"], init: "orbit", def: "static", flag: "--camera" },
+    { id: "orbit_period", label: "Orbit period", type: "range", min: 5, max: 300, step: 5, init: 60, def: 60, flag: "--orbit-period", fmt: v => v + " s" },
+    { id: "orbit_dir", label: "Orbit direction", type: "select", options: ["random","cw","ccw"], init: "random", def: "random", flag: "--orbit-dir" },
+    { id: "orbit_bob", label: "Orbit bob", type: "range", min: 0, max: 3, step: 0.1, init: 0.3, def: 0.3, flag: "--orbit-bob" },
+    { id: "orbit_radius", label: "Orbit radius", type: "number", min: 0.5, max: 100, step: 0.5, init: "", def: "", flag: "--orbit-radius", placeholder: "auto" },
+    { id: "orbit_height", label: "Orbit height", type: "number", min: 0.5, max: 100, step: 0.5, init: "", def: "", flag: "--orbit-height", placeholder: "auto" },
+    { id: "smoothing_tau", label: "Smoothing", type: "range", min: 0.05, max: 3, step: 0.05, init: 0.35, def: 0.35, fmt: v => v + " s" },
+    { id: "poll_hz", label: "Sensor rate", type: "range", min: 1, max: 20, step: 1, init: 4, def: 4, fmt: v => v + " Hz" },
+  ]},
+];
+const FIELDS = {};
+for (const s of SECTIONS) for (const f of s.fields) { f.kind = f.kind || s.kind; FIELDS[f.id] = f; }
+
+// ------------------------------------------------------------------ state
+let values = {};       // what the controls show
+let applied = {};      // what the running app was last restarted with
+let metricRows = [];   // [{key, on, solid, ring}]
+let appliedMetrics = "";
+let liveMode = true;
+let paused = false;
+
+function initValues() {
+  values = {};
+  for (const id in FIELDS) if (FIELDS[id].type !== "metrics") values[id] = FIELDS[id].init;
+  metricRows = METRICS.map(m => ({ key: m.key, on: m.on, solid: m.def, ring: "auto", def: m.def, note: m.note }));
+}
+
+// ------------------------------------------------------------------ TOML / CLI
+const q = s => JSON.stringify(String(s));            // TOML basic string
+const num = v => { const n = Number(v); return Number.isFinite(n) ? (Number.isInteger(n) ? n.toFixed(1) : String(n)) : "0.0"; };
+const int = v => String(Math.round(Number(v) || 0));
+
+function tomlFor(v, rows, seed) {
+  const L = [];
+  const shown = rows.filter(r => r.on);
+  L.push("show = [" + shown.map(r => q(r.key)).join(", ") + "]");
+  L.push("fps_min = " + num(v.fps_min), "fps_max = " + num(v.fps_max), "fps_curve = " + q(v.fps_curve),
+         "fps_slew = " + num(v.fps_slew), "fps_invert = " + !!v.fps_invert);
+  L.push("spp = " + int(v.spp), "bounces = " + int(v.bounces), "max_steps = " + int(v.max_steps),
+         "adaptive_quality = " + !!v.adaptive_quality);
+  L.push("ramp = " + q(v.ramp), "char_aspect = " + num(v.char_aspect), "exposure = " + num(v.exposure),
+         "show_stats = " + !!v.show_stats, "aspect = " + q(v.aspect), "aspect_mode = " + q(v.aspect_mode));
+  L.push("legend = " + !!v.legend, "legend_size = " + int(v.legend_size), "legend_opacity = " + num(v.legend_opacity),
+         "legend_pos = " + q(v.legend_pos), "wireframe = " + !!v.wireframe);
+  L.push("camera = " + q(v.camera), "orbit_period = " + num(v.orbit_period), "orbit_dir = " + q(v.orbit_dir),
+         "orbit_bob = " + num(v.orbit_bob));
+  if (v.orbit_radius !== "" && v.orbit_radius != null) L.push("orbit_radius = " + num(v.orbit_radius));
+  if (v.orbit_height !== "" && v.orbit_height != null) L.push("orbit_height = " + num(v.orbit_height));
+  if (seed != null) L.push("seed = " + int(seed));
+  L.push("bg_lum = " + num(v.bg_lum), "bg_pattern = " + q(v.bg_pattern), "bg_contrast = " + num(v.bg_contrast),
+         "bg_scale = " + num(v.bg_scale), "bg_scroll = [" + num(v.bg_scroll_x) + ", " + num(v.bg_scroll_z) + "]",
+         "bg_sway = " + num(v.bg_sway), "bg_sway_period = " + num(v.bg_sway_period), "bg_rotate = " + q(v.bg_rotate),
+         "bg_rotate_period = " + num(v.bg_rotate_period));
+  L.push("min_scale = " + num(v.min_scale), "max_scale = " + num(v.max_scale), "idle_spin = " + num(v.idle_spin),
+         "max_spin = " + num(v.max_spin), "smoothing_tau = " + num(v.smoothing_tau), "poll_hz = " + num(v.poll_hz));
+  const solids = shown.filter(r => r.solid !== r.def), rings = shown.filter(r => r.ring !== "auto");
+  L.push("", "[solids]"); for (const r of solids) L.push(q(r.key) + " = " + q(r.solid));
+  L.push("", "[rings]"); for (const r of rings) L.push(q(r.key) + " = " + int(r.ring));
+  return L.join("\n") + "\n";
+}
+
+function psQuote(s) { return /^[A-Za-z0-9._:\/=+-]+$/.test(s) ? s : "'" + String(s).replace(/'/g, "''") + "'"; }
+
+function cliFor(v, rows) {
+  const a = ["platomon"];
+  const shown = rows.filter(r => r.on);
+  const defShow = ["cpu","ram","disk","net","gpu"];
+  if (shown.map(r => r.key).join(",") !== defShow.join(",")) a.push("--show", psQuote(shown.map(r => r.key).join(",")));
+  for (const r of shown) if (r.solid !== r.def) a.push("--solid", psQuote(r.key + "=" + r.solid));
+  for (const r of shown) if (r.ring !== "auto") a.push("--ring", psQuote(r.key + "=" + r.ring));
+  let configOnly = 0;
+  for (const id in FIELDS) {
+    const f = FIELDS[id];
+    if (!("def" in f) || f.type === "metrics") continue;
+    const val = v[id];
+    const same = f.type === "check" ? !!val === !!f.def : String(val) === String(f.def);
+    if (same) continue;
+    if (!f.flag) { if (!(id === "char_aspect" && v.char_auto)) configOnly++; continue; }
+    if (f.type === "check") { if (val) a.push(f.flag); else configOnly++; continue; }
+    if (id === "legend_pos") { a.push(f.flag, { "top-left": "tl", "top-right": "tr", "bottom-left": "bl", "bottom-right": "br" }[val]); continue; }
+    a.push(f.flag, psQuote(String(val)));
+  }
+  if (v.bg_scroll_x != 0 || v.bg_scroll_z != 0) a.push("--bg-scroll", v.bg_scroll_x + ":" + v.bg_scroll_z);
+  return a.join(" ") + (configOnly ? `\n# + ${configOnly} setting(s) with no flag: use the config.toml below with --config` : "");
+}
+
+// ------------------------------------------------------------------ wasm
+let W = null;
+const enc = new TextEncoder(), dec = new TextDecoder();
+
+async function loadWasm() {
+  const bytes = Uint8Array.from(atob(WASM_B64), c => c.charCodeAt(0));
+  const mod = await WebAssembly.compile(bytes);
+  const imports = {};
+  for (const imp of WebAssembly.Module.imports(mod)) {   // none expected; stub defensively
+    (imports[imp.module] = imports[imp.module] || {})[imp.name] = () => 0;
+  }
+  const inst = await WebAssembly.instantiate(mod, imports);
+  W = inst.exports;
+}
+
+function sendConfig(restart) {
+  const seed = restart ? (values.orbit_dir === "random" ? Math.floor(Math.random() * 1e9) : 1) : null;
+  const text = tomlFor(values, metricRows, seed ?? currentSeed);
+  if (restart) currentSeed = seed;
+  const b = enc.encode(text);
+  const ptr = W.input_buffer(b.length);
+  new Uint8Array(W.memory.buffer, ptr, b.length).set(b);
+  const ok = W.configure(b.length, restart ? 1 : 0);
+  const msg = document.getElementById("msg");
+  if (!ok) {
+    const m = dec.decode(new Uint8Array(W.memory.buffer, W.message_ptr(), W.message_len()));
+    msg.className = ""; msg.textContent = "Config error: " + m;
+    return false;
+  }
+  msg.textContent = "";
+  return true;
+}
+let currentSeed = 1;
+
+function sendSim() {
+  W.set_sim(PROFILES.indexOf(values.profile), Number(values.speed), Number(values.manual), Number(values.simseed) >>> 0);
+}
+
+// ------------------------------------------------------------------ UI build
+const $ = id => document.getElementById(id);
+
+function fieldControl(f) {
+  const row = document.createElement("div");
+  row.className = "row"; row.dataset.id = f.id;
+  const lab = document.createElement("label"); lab.textContent = f.label; lab.htmlFor = "f-" + f.id;
+  let input, out = document.createElement("output");
+  if (f.type === "select") {
+    input = document.createElement("select");
+    for (const o of f.options) { const op = document.createElement("option"); op.value = op.textContent = o; input.append(op); }
+  } else {
+    input = document.createElement("input");
+    input.type = f.type === "check" ? "checkbox" : f.type;
+    for (const k of ["min","max","step"]) if (k in f) input[k] = f[k];
+    if (f.placeholder) input.placeholder = f.placeholder;
+  }
+  input.id = "f-" + f.id;
+  const evt = f.type === "range" || f.type === "text" ? "input" : "change";
+  input.addEventListener(evt, () => {
+    values[f.id] = f.type === "check" ? input.checked : (f.type === "range" ? Number(input.value) : input.value);
+    onChange(f);
+  });
+  row.append(lab, input, out);
+  return row;
+}
+
+function metricsControl() {
+  const wrap = document.createElement("div");
+  const t = document.createElement("table"); t.className = "metrics";
+  t.innerHTML = "<thead><tr><th></th><th>Metric</th><th>Solid</th><th>Ring</th></tr></thead>";
+  const tb = document.createElement("tbody");
+  metricRows.forEach((r, i) => {
+    const tr = document.createElement("tr"); tr.dataset.i = i;
+    const on = document.createElement("input"); on.type = "checkbox";
+    const so = document.createElement("select");
+    for (const s of SOLIDS) { const o = document.createElement("option"); o.value = s; o.textContent = s; so.append(o); }
+    const ri = document.createElement("select");
+    for (const s of ["auto","0","1","2","3","4","5"]) { const o = document.createElement("option"); o.value = o.textContent = s; ri.append(o); }
+    on.addEventListener("change", () => { r.on = on.checked; onChange({ kind: "restart", id: "metrics" }); });
+    so.addEventListener("change", () => { r.solid = so.value; onChange({ kind: "restart", id: "metrics" }); });
+    ri.addEventListener("change", () => { r.ring = ri.value; onChange({ kind: "restart", id: "metrics" }); });
+    const name = document.createElement("td"); name.textContent = r.key; if (r.note) name.title = r.note;
+    const c = [document.createElement("td"), name, document.createElement("td"), document.createElement("td")];
+    c[0].append(on); c[2].append(so); c[3].append(ri);
+    tr.append(...c); tb.append(tr);
+  });
+  t.append(tb); wrap.append(t);
+  const h = document.createElement("div"); h.className = "hint";
+  h.textContent = "Max 16 metrics. Simulated adapters: Ethernet, Wi-Fi, vEthernet; disks C:\\ D:\\ E:\\.";
+  wrap.append(h);
+  return wrap;
+}
+
+function buildUI() {
+  const host = $("sections"); host.innerHTML = "";
+  for (const s of SECTIONS) {
+    const d = document.createElement("details"); if (s.open) d.open = true;
+    const sum = document.createElement("summary"); sum.textContent = s.title;
+    const tag = document.createElement("span");
+    tag.className = "tag " + (s.kind === "restart" ? "restart" : "live");
+    tag.textContent = s.kind === "restart" ? "on Apply" : s.kind === "sim" ? "instant" : "live";
+    sum.append(tag); d.append(sum);
+    const body = document.createElement("div"); body.className = "body";
+    for (const f of s.fields) body.append(f.type === "metrics" ? metricsControl() : fieldControl(f));
+    d.append(body); host.append(d);
+  }
+  syncControls();
+}
+
+function syncControls() {
+  for (const id in FIELDS) {
+    const f = FIELDS[id]; if (f.type === "metrics") continue;
+    const el = $("f-" + id); if (!el) continue;
+    if (f.type === "check") el.checked = !!values[id]; else el.value = values[id];
+    const out = el.parentElement.querySelector("output");
+    if (out) out.textContent = f.type === "range" ? (f.fmt ? f.fmt(values[id]) : values[id]) : "";
+  }
+  $("f-char_aspect").disabled = !!values.char_auto;
+  $("f-ramp").disabled = values.ramp_preset !== "custom";
+  $("f-manual").disabled = values.profile !== "manual";
+  document.querySelectorAll("table.metrics tbody tr").forEach(tr => {
+    const r = metricRows[tr.dataset.i]; const [on, so, ri] = tr.querySelectorAll("input,select");
+    on.checked = r.on; so.value = r.solid; ri.value = r.ring;
+  });
+  markPending();
+}
+
+function pendingIds() {
+  const p = new Set();
+  for (const id in FIELDS) {
+    const f = FIELDS[id]; if (f.type === "metrics" || f.kind === "sim" || f.kind === "view") continue;
+    const needsApply = f.kind === "restart" || !liveMode;
+    if (needsApply && String(values[id]) !== String(applied[id])) p.add(id);
+  }
+  if (JSON.stringify(metricRows) !== appliedMetrics) p.add("metrics");
+  return p;
+}
+
+function markPending() {
+  const p = pendingIds();
+  document.querySelectorAll(".row").forEach(r => r.classList.toggle("pending", p.has(r.dataset.id)));
+  const am = appliedMetrics ? JSON.parse(appliedMetrics) : [];
+  document.querySelectorAll("table.metrics tbody tr").forEach(tr => {
+    const i = tr.dataset.i; tr.classList.toggle("pending", JSON.stringify(metricRows[i]) !== JSON.stringify(am[i]));
+  });
+  const b = $("apply");
+  b.classList.toggle("has-pending", p.size > 0);
+  b.textContent = p.size ? `Apply & restart (${p.size})` : "Apply & restart";
+  $("cli").value = cliFor(values, metricRows);
+  $("toml").value = tomlFor(values, metricRows, null);
+}
+
+function onChange(f) {
+  if (f.id === "ramp_preset" && values.ramp_preset !== "custom") values.ramp = RAMPS[values.ramp_preset];
+  if (f.id === "fps_min" && values.fps_max < values.fps_min) values.fps_max = values.fps_min;
+  if (f.id === "fps_max" && values.fps_min > values.fps_max) values.fps_min = values.fps_max;
+  if (f.id === "min_scale" && values.max_scale < values.min_scale) values.max_scale = values.min_scale;
+  if (f.id === "max_scale" && values.min_scale > values.max_scale) values.min_scale = values.max_scale;
+  if (f.kind === "sim") sendSim();
+  if (f.id === "font" || f.id === "char_auto") measure();
+  if (liveMode && (f.kind === "live" || f.id === "ramp_preset" || f.id === "char_auto" || f.id === "font")) applyLive();
+  syncControls();
+}
+
+function applyLive() {
+  if (sendConfig(false)) for (const id in FIELDS) if (FIELDS[id].kind === "live") applied[id] = values[id];
+}
+
+function applyRestart() {
+  if (metricRows.filter(r => r.on).length === 0) { $("msg").className = ""; $("msg").textContent = "Pick at least one metric."; return; }
+  if (metricRows.filter(r => r.on).length > 16) { $("msg").className = ""; $("msg").textContent = "At most 16 metrics."; return; }
+  if (sendConfig(true)) {
+    applied = { ...values }; appliedMetrics = JSON.stringify(metricRows);
+    $("msg").className = "ok"; $("msg").textContent = "Restarted with the new settings.";
+    setTimeout(() => { if ($("msg").className === "ok") $("msg").textContent = ""; }, 2500);
+  }
+  syncControls();
+}
+
+// ------------------------------------------------------------------ screen sizing
+let cols = 80, rows = 24, cellW = 7, cellH = 12;
+function measure() {
+  const screen = $("screen"), probe = $("probe");
+  const px = values.font + "px";
+  screen.style.fontSize = probe.style.fontSize = px;
+  probe.textContent = "M".repeat(200);
+  const r = probe.getBoundingClientRect();
+  cellW = r.width / 200; cellH = r.height || values.font;
+  cols = Math.max(20, Math.floor(window.innerWidth / cellW));
+  rows = Math.max(8, Math.floor(window.innerHeight / cellH));
+  if (values.char_auto) values.char_aspect = Math.round(cellW / cellH * 1000) / 1000;
+}
+
+// ------------------------------------------------------------------ frame loop
+let last = performance.now(), lastDrawn = last, achieved = 0, lastRender = 0.01, renderMs = 0;
+const hist = [];
+function loop(now) {
+  requestAnimationFrame(loop);
+  if (!W || paused) { last = now; return; }
+  const target = W.target_fps();
+  const since = (now - lastDrawn) / 1000;
+  if (since < 1 / target - 0.002) return;          // pace to platomon's target fps
+  const dt = Math.min(0.25, since);
+  lastDrawn = now;
+  if (dt > 0) achieved += (1 / dt - achieved) * (1 - Math.exp(-dt / 0.5));
+  const t0 = performance.now();
+  const len = W.frame(dt, cols, rows, achieved, lastRender);
+  const text = dec.decode(new Uint8Array(W.memory.buffer, W.output_ptr(), len));
+  lastRender = (performance.now() - t0) / 1000;
+  renderMs += (lastRender * 1000 - renderMs) * 0.1;
+  $("screen").textContent = text;
+  hist.push([W.sim_load(), W.activity(), target / Math.max(1, values.fps_max)]);
+  if (hist.length > 240) hist.shift();
+  if (!$("panel").classList.contains("hidden")) { drawGraph(); status(target); }
+}
+
+function status(target) {
+  const qv = W.quality();
+  $("status").innerHTML =
+    `<b>${Math.round(achieved)}</b> fps drawn · target <b>${Math.round(target)}</b> · render <b>${renderMs.toFixed(1)}</b> ms` +
+    (qv ? ` · quality <b>q-${qv}</b>` : "") +
+    `<br>grid <b>${cols}×${rows}</b> · cell ${cellW.toFixed(1)}×${cellH.toFixed(1)} px · sim <b>${values.profile}</b> ${Math.round(W.sim_load() * 100)}%` +
+    `<br><span class="hint">The browser caps drawing at the display refresh rate.</span>`;
+}
+
+function drawGraph() {
+  const c = $("graph"), g = c.getContext("2d"), w = c.width, h = c.height;
+  g.clearRect(0, 0, w, h);
+  g.strokeStyle = "#20252c"; g.lineWidth = 1;
+  for (const y of [0.25, 0.5, 0.75]) { g.beginPath(); g.moveTo(0, h * y); g.lineTo(w, h * y); g.stroke(); }
+  const colors = ["#ffb454", "#7cc4ff", "#7bd88f"];
+  for (let k = 0; k < 3; k++) {
+    g.strokeStyle = colors[k]; g.lineWidth = 2.5; g.beginPath();
+    hist.forEach((p, i) => { const x = i / 239 * w, y = h - 4 - p[k] * (h - 8); i ? g.lineTo(x, y) : g.moveTo(x, y); });
+    g.stroke();
+  }
+}
+
+// ------------------------------------------------------------------ wiring
+function setMode(live) {
+  liveMode = live;
+  $("mode-live").classList.toggle("on", live); $("mode-manual").classList.toggle("on", !live);
+  if (live) applyLive();
+  syncControls();
+}
+
+function toggleField(id) {
+  values[id] = !values[id]; onChange(FIELDS[id]);
+  if (!liveMode) { /* stays pending */ }
+}
+
+window.addEventListener("keydown", e => {
+  if (e.target.matches("input, select, textarea") || e.ctrlKey || e.metaKey || e.altKey) return;
+  const k = e.key.toLowerCase();
+  if (k === "g") $("panel").classList.toggle("hidden");
+  else if (k === "s") toggleField("show_stats");
+  else if (k === "l") toggleField("legend");
+  else if (k === "w") toggleField("wireframe");
+  else if (k === " ") { paused = !paused; e.preventDefault(); }
+  else return;
+});
+$("toggle").onclick = () => $("panel").classList.toggle("hidden");
+$("mode-live").onclick = () => setMode(true);
+$("mode-manual").onclick = () => setMode(false);
+$("apply").onclick = applyRestart;
+$("reset").onclick = () => { initValues(); measure(); buildUI(); sendSim(); applyRestart(); };
+$("copy-cli").onclick = () => navigator.clipboard?.writeText($("cli").value);
+$("copy-toml").onclick = () => navigator.clipboard?.writeText($("toml").value);
+let resizeTimer = 0;
+window.addEventListener("resize", () => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(() => { const a = values.char_aspect; measure(); if (a !== values.char_aspect && liveMode) applyLive(); syncControls(); }, 60);
+});
+
+(async () => {
+  try {
+    initValues();
+    measure();
+    buildUI();
+    await loadWasm();
+    sendSim();
+    applyRestart();
+    $("msg").textContent = "";
+    requestAnimationFrame(loop);
+  } catch (e) {
+    $("screen").textContent = "platomon failed to start:\n" + (e && e.stack || e);
+  }
+})();
+</script>
+</body>
+</html>

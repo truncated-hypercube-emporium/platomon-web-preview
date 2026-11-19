@@ -54,6 +54,8 @@ pub struct FrameClock {
     max: f32,
     curve: FpsCurve,
     slew: f32,
+    /// Idle runs fast, load runs slow.
+    invert: bool,
     target: f32,
     /// EMA of frame duration, seconds.
     avg_dt: f32,
@@ -69,12 +71,20 @@ impl FrameClock {
     pub fn new(min: f32, max: f32, curve: FpsCurve, slew: f32) -> Self {
         let min = min.max(1.0);
         let max = max.max(min);
-        Self { min, max, curve, slew, target: min, avg_dt: 1.0 / min, last_frame: Instant::now() }
+        Self { min, max, curve, slew, invert: false, target: min, avg_dt: 1.0 / min, last_frame: Instant::now() }
+    }
+
+    /// Invert the mapping: idle → `max` fps, full load → `min` fps.
+    pub fn inverted(mut self, invert: bool) -> Self {
+        self.invert = invert;
+        self
     }
 
     /// Update the target from the activity score, slew-limited over `dt`.
     pub fn update_target(&mut self, activity: f32, dt: f32) {
-        let want = activity_to_fps(activity, self.min, self.max, self.curve);
+        let a = if activity.is_finite() { activity.clamp(0.0, 1.0) } else { 0.0 };
+        let a = if self.invert { 1.0 - a } else { a };
+        let want = activity_to_fps(a, self.min, self.max, self.curve);
         self.target = slew_limit(self.target, want, self.slew, dt).clamp(self.min, self.max);
     }
 
@@ -154,6 +164,23 @@ mod tests {
             c.update_target(0.0, 1.0);
         }
         assert_eq!(c.target_fps(), 5.0);
+    }
+
+    #[test]
+    fn inverted_clock_runs_fast_when_idle() {
+        let mut c = FrameClock::new(5.0, 150.0, FpsCurve::Linear, 1000.0).inverted(true);
+        c.update_target(0.0, 1.0);
+        assert_eq!(c.target_fps(), 150.0, "idle → max");
+        c.update_target(1.0, 1.0);
+        assert_eq!(c.target_fps(), 5.0, "full load → min");
+        c.update_target(0.25, 1.0);
+        assert_eq!(c.target_fps(), 5.0 + 145.0 * 0.75);
+        c.update_target(f32::NAN, 1.0);
+        assert_eq!(c.target_fps(), 150.0, "no reading counts as idle");
+        // slew still applies
+        let mut c = FrameClock::new(5.0, 150.0, FpsCurve::Sqrt, 60.0).inverted(true);
+        c.update_target(0.0, 1.0);
+        assert_eq!(c.target_fps(), 65.0);
     }
 
     /// Timing-sensitive, so it is kept out of the parallel test run: the

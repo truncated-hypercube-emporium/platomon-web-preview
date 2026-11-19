@@ -1,5 +1,6 @@
 //! Key handling and the stats bar.
 
+#[cfg(not(target_arch = "wasm32"))]
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::metrics::{MetricKind, Reading};
@@ -14,6 +15,7 @@ pub enum Action {
     Resize(u16, u16),
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub fn map_event(ev: &Event) -> Action {
     match ev {
         Event::Key(KeyEvent { code, modifiers, kind, .. }) => {

@@ -62,6 +62,8 @@ pub struct Config {
     pub fps_curve: FpsCurve,
     /// Maximum change of the target fps, in fps per second.
     pub fps_slew: f32,
+    /// Invert the load → fps mapping: idle runs at `fps_max`, full load at `fps_min`.
+    pub fps_invert: bool,
 
     // --- renderer ---
     pub spp: u32,
@@ -160,6 +162,7 @@ impl Default for Config {
             fps_max: 150.0,
             fps_curve: FpsCurve::Sqrt,
             fps_slew: 60.0,
+            fps_invert: false,
             spp: 2,
             bounces: 2,
             max_steps: 64,
@@ -233,7 +236,10 @@ fn lookup<'a, V>(table: &'a [(MetricSpec, V)], spec: &MetricSpec) -> Option<&'a 
 impl Config {
     /// `<platform config dir>/platomon/config.toml`
     pub fn default_path() -> Option<PathBuf> {
-        dirs::config_dir().map(|d| d.join("platomon").join("config.toml"))
+        #[cfg(not(target_arch = "wasm32"))]
+        return dirs::config_dir().map(|d| d.join("platomon").join("config.toml"));
+        #[cfg(target_arch = "wasm32")]
+        None
     }
 
     pub fn from_toml(text: &str) -> Result<Self, String> {

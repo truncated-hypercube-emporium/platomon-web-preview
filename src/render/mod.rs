@@ -4,6 +4,7 @@ pub mod march;
 pub mod trace;
 
 use glam::Vec3A;
+#[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 
 use crate::scene::{Camera, Scene};
@@ -126,11 +127,12 @@ impl Renderer {
         let frame = self.frame;
         let ts = rs.trace;
 
-        self.buf
-            .par_chunks_mut(w)
-            .zip(self.depth.par_chunks_mut(w))
-            .zip(self.ids.par_chunks_mut(w))
-            .enumerate()
+        // Rows in parallel natively; the browser build has one thread.
+        #[cfg(not(target_arch = "wasm32"))]
+        let rows = self.buf.par_chunks_mut(w).zip(self.depth.par_chunks_mut(w)).zip(self.ids.par_chunks_mut(w));
+        #[cfg(target_arch = "wasm32")]
+        let rows = self.buf.chunks_mut(w).zip(self.depth.chunks_mut(w)).zip(self.ids.chunks_mut(w));
+        rows.enumerate()
             .for_each(|(y, ((row, drow), irow))| {
                 let mut rng = fastrand::Rng::with_seed(seed(frame, y));
                 for (x, out) in row.iter_mut().enumerate() {
