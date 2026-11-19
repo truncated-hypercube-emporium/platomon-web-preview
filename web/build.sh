@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Build the browser version: web/dist/index.html (self-contained, wasm inlined).
-# Bash counterpart of build.ps1, for Linux/macOS and the GitHub Pages workflow.
+# Also copies it to ./index.html at the repo root, which GitHub Pages serves at the site root.
+# Bash counterpart of build.ps1, for Linux/macOS and CI.
 # Needs: rustup target add wasm32-unknown-unknown, python3
 set -euo pipefail
 
@@ -24,8 +25,7 @@ open(dst, "w", encoding="utf-8", newline="").write(html)
 PY
 
 cp "$wasm" "$out/platomon_web.wasm"
-# Serve files as-is on GitHub Pages (no Jekyll processing).
-touch "$out/.nojekyll"
+cp "$out/index.html" "$root/index.html"
 
 printf '%s  (%d KB, wasm %d KB)\n' "$out/index.html" \
   $(( $(wc -c < "$out/index.html") / 1024 )) $(( $(wc -c < "$wasm") / 1024 ))

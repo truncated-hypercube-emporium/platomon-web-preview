@@ -1,4 +1,5 @@
-# Build the browser version: web/dist/index.html (self-contained, wasm inlined).
+# Build the browser version: web/dist/index.html (self-contained, wasm inlined),
+# also copied to ./index.html at the repo root for GitHub Pages.
 # Needs: rustup target add wasm32-unknown-unknown
 param([string]$TargetDir = $env:CARGO_TARGET_DIR)
 # (Not "Stop": Windows PowerShell 5.1 turns cargo's progress on stderr into errors.)
@@ -19,4 +20,6 @@ $tmpl = [IO.File]::ReadAllText((Join-Path $PSScriptRoot "index.template.html"))
 $html = $tmpl.Replace("__WASM_BASE64__", $b64)
 [IO.File]::WriteAllText((Join-Path $out "index.html"), $html, (New-Object Text.UTF8Encoding($false)))
 Copy-Item $wasm (Join-Path $out "platomon_web.wasm") -Force
+# Repo-root copy: GitHub Pages serves it at the site root.
+Copy-Item (Join-Path $out "index.html") (Join-Path $root "index.html") -Force
 "{0}  ({1:N0} KB, wasm {2:N0} KB)" -f (Join-Path $out "index.html"), ((Get-Item (Join-Path $out "index.html")).Length / 1KB), ((Get-Item $wasm).Length / 1KB)

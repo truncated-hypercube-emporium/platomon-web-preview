@@ -13,18 +13,20 @@ simulated sensor sequence instead of the OS, so it behaves as if it ran on a mac
 keeps changing. Everything after the sensors is the real pipeline: smoothing, rolling peaks,
 activity score, frame-rate curve, adaptive quality, legend and wireframe.
 
-**Live:** https://truncated-hypercube-emporium.github.io/platomon-web-preview/ — rebuilt and
-deployed to GitHub Pages by `.github/workflows/pages.yml` on every push to `main`
-(one-time setup: *Settings → Pages → Source: GitHub Actions*).
+**Live:** https://truncated-hypercube-emporium.github.io/platomon-web-preview/ runs the preview;
+this documentation is at [/readme/](https://truncated-hypercube-emporium.github.io/platomon-web-preview/readme/).
+GitHub Pages serves `main` as-is (*Settings → Pages → Deploy from a branch → main / root*):
+`index.html` at the repo root is the built page, and `.github/workflows/site.yml` rebuilds and
+commits it whenever `src/`, `web/` or the Cargo files change.
 
 ```powershell
 rustup target add wasm32-unknown-unknown   # once
-.\web\build.ps1                            # -> web\dist\index.html (wasm inlined, ~720 KB)
+.\web\build.ps1                            # -> web\dist\index.html + .\index.html (wasm inlined, ~720 KB)
 ```
 
 ```sh
 rustup target add wasm32-unknown-unknown   # once
-./web/build.sh                             # Linux/macOS (needs python3)
+./web/build.sh                             # Linux/macOS (needs python3); also writes ./index.html
 python3 -m http.server -d web/dist 8765    # optional local server
 ```
 
