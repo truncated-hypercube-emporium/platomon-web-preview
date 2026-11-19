@@ -13,9 +13,19 @@ simulated sensor sequence instead of the OS, so it behaves as if it ran on a mac
 keeps changing. Everything after the sensors is the real pipeline: smoothing, rolling peaks,
 activity score, frame-rate curve, adaptive quality, legend and wireframe.
 
+**Live:** https://truncated-hypercube-emporium.github.io/platomon-web-preview/ — rebuilt and
+deployed to GitHub Pages by `.github/workflows/pages.yml` on every push to `main`
+(one-time setup: *Settings → Pages → Source: GitHub Actions*).
+
 ```powershell
 rustup target add wasm32-unknown-unknown   # once
 .\web\build.ps1                            # -> web\dist\index.html (wasm inlined, ~720 KB)
+```
+
+```sh
+rustup target add wasm32-unknown-unknown   # once
+./web/build.sh                             # Linux/macOS (needs python3)
+python3 -m http.server -d web/dist 8765    # optional local server
 ```
 
 Open `web\dist\index.html` straight from disk, or serve it with `.\web\serve.ps1` (http://localhost:8765).
