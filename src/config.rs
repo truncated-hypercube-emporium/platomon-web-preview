@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 
 use crate::aspect::AspectMode;
 use crate::clock::FpsCurve;
+use crate::color::{ColorBy, ColorDepth, ColorMap, Gradient};
+use crate::scene::Layout;
 use crate::metrics::{MetricKind, MetricSpec};
 use crate::overlay::{LEGEND_SIZE_MAX, LEGEND_SIZE_MIN, LegendParams, LegendPos};
 use crate::scene::camera::{CameraMode, OrbitDir};
@@ -95,6 +97,20 @@ pub struct Config {
     /// Inverted-luminosity wireframe over every solid (key `w`).
     pub wireframe: bool,
 
+    // --- colour ---
+    /// `off`, a gradient preset (`inferno`, `viridis`, `traffic`, ...) or hex
+    /// stops like `"#000:#f80:#fff"`.
+    pub color: String,
+    /// `lum`: colour by brightness; `load`: each solid by its metric's load.
+    pub color_by: ColorBy,
+    /// `24bit` or `256`.
+    pub color_depth: ColorDepth,
+    pub color_reverse: bool,
+
+    // --- layout ---
+    /// `rings` (on the ground) or `sphere` (concentric spherical shells).
+    pub layout: Layout,
+
     // --- camera ---
     pub camera: CameraMode,
     /// Seconds per revolution.
@@ -107,6 +123,10 @@ pub struct Config {
     pub orbit_height: Option<f32>,
     /// Vertical drift amplitude while orbiting.
     pub orbit_bob: f32,
+    /// Focus camera: 0 = only turn toward the busiest solid, 1 = close-up.
+    pub focus_zoom: f32,
+    /// Focus camera: glide time constant, seconds.
+    pub focus_tau: f32,
     /// RNG seed for random choices (orbit direction); unset = random.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seed: Option<u64>,
@@ -179,6 +199,13 @@ impl Default for Config {
             legend_opacity: LegendParams::default().opacity,
             legend_pos: LegendPos::TopLeft,
             wireframe: false,
+            color: "off".to_string(),
+            color_by: ColorBy::Lum,
+            color_depth: ColorDepth::True,
+            color_reverse: false,
+            layout: Layout::Rings,
+            focus_zoom: 0.6,
+            focus_tau: 1.5,
             camera: CameraMode::Static,
             orbit_period: 60.0,
             orbit_dir: OrbitDir::Random,
@@ -286,6 +313,12 @@ impl Config {
         self.legend_size = self.legend_size.clamp(LEGEND_SIZE_MIN, LEGEND_SIZE_MAX);
         self.legend_opacity = finite_or(self.legend_opacity, d.legend_opacity).clamp(0.0, 1.0);
 
+        self.focus_zoom = finite_or(self.focus_zoom, d.focus_zoom).clamp(0.0, 1.0);
+        self.focus_tau = finite_or(self.focus_tau, d.focus_tau).clamp(0.05, 60.0);
+        if self.color.trim().is_empty() {
+            self.color = d.color.clone();
+        }
+
         self.orbit_period = finite_or(self.orbit_period, d.orbit_period).clamp(2.0, 86_400.0);
         self.orbit_bob = finite_or(self.orbit_bob, d.orbit_bob).clamp(0.0, 10.0);
 
@@ -335,6 +368,16 @@ impl Config {
             rotate: self.bg_rotate,
             rotate_period: self.bg_rotate_period,
         }
+    }
+
+    /// The colour mapping, or `None` for monochrome (`color = "off"`).
+    pub fn color_map(&self) -> Result<Option<ColorMap>, String> {
+        if matches!(self.color.trim().to_ascii_lowercase().as_str(), "off" | "none" | "mono") {
+            return Ok(None);
+        }
+        let g = Gradient::parse(&self.color)?;
+        let gradient = if self.color_reverse { g.reversed() } else { g };
+        Ok(Some(ColorMap { gradient, by: self.color_by, depth: self.color_depth }))
     }
 
     pub fn legend_params(&self) -> LegendParams {
@@ -504,6 +547,23 @@ mod tests {
         c.sanitize();
         assert_eq!((c.bg_lum, c.bg_contrast, c.bg_scroll), (10.0, 0.0, [0.0, 3.0]));
         assert_eq!(Config::default().bg_lum, 5.0, "default reproduces the original ground");
+    }
+
+    #[test]
+    fn colour_layout_and_focus_settings() {
+        assert_eq!(Config::default().color_map().unwrap(), None);
+        let c = Config::from_toml(
+            "color = \"viridis\"\ncolor_by = \"load\"\ncolor_depth = \"256\"\ncolor_reverse = true\nlayout = \"sphere\"\ncamera = \"focus\"\nfocus_zoom = 0.9\n",
+        )
+        .unwrap();
+        let m = c.color_map().unwrap().unwrap();
+        assert_eq!((m.by, m.depth), (ColorBy::Load, ColorDepth::Ansi256));
+        assert_eq!(m.gradient.sample(0.0, 1.0), 0xfde725, "reversed: starts at viridis' yellow");
+        assert_eq!((c.layout, c.camera, c.focus_zoom), (Layout::Sphere, CameraMode::Focus, 0.9));
+        assert!(Config { color: "plaid".into(), ..Config::default() }.color_map().is_err());
+        assert!(Config::from_toml("layout = \"cube\"").is_err());
+        let back = Config::from_toml(&c.to_toml()).unwrap();
+        assert_eq!(back, c);
     }
 
     #[test]

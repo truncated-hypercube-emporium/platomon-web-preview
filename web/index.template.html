@@ -160,6 +160,7 @@ const METRICS = [
   { key: "disk-dev:E:\\", def: "truncated-cube", on: false },
 ];
 const RAMPS = { default: " .,:;-~=+*ox#%&@", classic: " .:-=+*#%@", blocks: " ░▒▓█", dots: " ·:∙•●" };
+const GRADIENTS = ["inferno","viridis","plasma","fire","ice","ocean","sunset","matrix","amber","grey","traffic","rainbow"];
 const ASPECTS = ["fill","vga","svga","xga","sxga","wxga","hd","wxga+","fhd","wuxga","qhd","uwfhd","uwqhd","uhd","square","21:9","32:9"];
 
 // kind: sim (instant, no restart), view (page only), live (configure restart=0), restart (needs Apply)
@@ -188,6 +189,13 @@ const SECTIONS = [
     { id: "legend_opacity", label: "Legend opacity", type: "range", min: 0, max: 1, step: 0.05, init: 0.85, def: 0.85, flag: "--legend-opacity" },
     { id: "legend_pos", label: "Legend corner", type: "select", options: ["top-left","top-right","bottom-left","bottom-right"], init: "top-left", def: "top-left", flag: "--legend-pos" },
     { id: "wireframe", label: "Wireframe", type: "check", init: false, def: false, flag: "--wireframe" },
+  ]},
+  { title: "Colour", kind: "live", fields: [
+    { id: "color_preset", label: "Gradient", type: "select", options: ["off", ...GRADIENTS, "custom"], init: "off", kind: "view" },
+    { id: "color", label: "Hex stops", type: "text", init: "off", def: "off", flag: "--color", placeholder: "#000:#f80:#fff" },
+    { id: "color_by", label: "Colour by", type: "select", options: ["lum","load"], init: "lum", def: "lum", flag: "--color-by" },
+    { id: "color_depth", label: "Depth", type: "select", options: ["24bit","256"], init: "24bit", def: "24bit", flag: "--color-depth" },
+    { id: "color_reverse", label: "Reverse", type: "check", init: false, def: false, flag: "--color-reverse" },
   ]},
   { title: "Frame rate", kind: "live", fields: [
     { id: "fps_min", label: "Min fps (idle)", type: "range", min: 1, max: 60, step: 1, init: 5, def: 5, flag: "--fps-min" },
@@ -222,7 +230,10 @@ const SECTIONS = [
   ]},
   { title: "Scene & camera", kind: "restart", fields: [
     { id: "metrics", type: "metrics" },
-    { id: "camera", label: "Camera", type: "select", options: ["static","orbit"], init: "orbit", def: "static", flag: "--camera" },
+    { id: "layout", label: "Layout", type: "select", options: ["rings","sphere"], init: "rings", def: "rings", flag: "--layout" },
+    { id: "camera", label: "Camera", type: "select", options: ["static","orbit","focus"], init: "orbit", def: "static", flag: "--camera" },
+    { id: "focus_zoom", label: "Focus zoom", type: "range", min: 0, max: 1, step: 0.05, init: 0.6, def: 0.6, flag: "--focus-zoom" },
+    { id: "focus_tau", label: "Focus glide", type: "range", min: 0.1, max: 10, step: 0.1, init: 1.5, def: 1.5, flag: "--focus-tau", fmt: v => v + " s" },
     { id: "orbit_period", label: "Orbit period", type: "range", min: 5, max: 300, step: 5, init: 60, def: 60, flag: "--orbit-period", fmt: v => v + " s" },
     { id: "orbit_dir", label: "Orbit direction", type: "select", options: ["random","cw","ccw"], init: "random", def: "random", flag: "--orbit-dir" },
     { id: "orbit_bob", label: "Orbit bob", type: "range", min: 0, max: 3, step: 0.1, init: 0.3, def: 0.3, flag: "--orbit-bob" },
@@ -266,8 +277,10 @@ function tomlFor(v, rows, seed) {
          "show_stats = " + !!v.show_stats, "aspect = " + q(v.aspect), "aspect_mode = " + q(v.aspect_mode));
   L.push("legend = " + !!v.legend, "legend_size = " + int(v.legend_size), "legend_opacity = " + num(v.legend_opacity),
          "legend_pos = " + q(v.legend_pos), "wireframe = " + !!v.wireframe);
+  L.push("color = " + q(v.color || "off"), "color_by = " + q(v.color_by), "color_depth = " + q(v.color_depth),
+         "color_reverse = " + !!v.color_reverse, "layout = " + q(v.layout));
   L.push("camera = " + q(v.camera), "orbit_period = " + num(v.orbit_period), "orbit_dir = " + q(v.orbit_dir),
-         "orbit_bob = " + num(v.orbit_bob));
+         "orbit_bob = " + num(v.orbit_bob), "focus_zoom = " + num(v.focus_zoom), "focus_tau = " + num(v.focus_tau));
   if (v.orbit_radius !== "" && v.orbit_radius != null) L.push("orbit_radius = " + num(v.orbit_radius));
   if (v.orbit_height !== "" && v.orbit_height != null) L.push("orbit_height = " + num(v.orbit_height));
   if (seed != null) L.push("seed = " + int(seed));
@@ -426,6 +439,10 @@ function syncControls() {
   }
   $("f-char_aspect").disabled = !!values.char_auto;
   $("f-ramp").disabled = values.ramp_preset !== "custom";
+  $("f-color").disabled = values.color_preset !== "custom";
+  for (const id of ["color_by", "color_depth", "color_reverse"]) $("f-" + id).disabled = values.color === "off";
+  for (const id of ["focus_zoom", "focus_tau"]) $("f-" + id).disabled = values.camera !== "focus";
+  for (const id of ["orbit_period", "orbit_dir", "orbit_bob", "orbit_radius", "orbit_height"]) $("f-" + id).disabled = values.camera !== "orbit";
   $("f-manual").disabled = values.profile !== "manual";
   document.querySelectorAll("table.metrics tbody tr").forEach(tr => {
     const r = metricRows[tr.dataset.i]; const [on, so, ri] = tr.querySelectorAll("input,select");
@@ -461,13 +478,14 @@ function markPending() {
 
 function onChange(f) {
   if (f.id === "ramp_preset" && values.ramp_preset !== "custom") values.ramp = RAMPS[values.ramp_preset];
+  if (f.id === "color_preset") values.color = values.color_preset === "custom" ? "#000:#f80:#fff" : values.color_preset;
   if (f.id === "fps_min" && values.fps_max < values.fps_min) values.fps_max = values.fps_min;
   if (f.id === "fps_max" && values.fps_min > values.fps_max) values.fps_min = values.fps_max;
   if (f.id === "min_scale" && values.max_scale < values.min_scale) values.max_scale = values.min_scale;
   if (f.id === "max_scale" && values.min_scale > values.max_scale) values.min_scale = values.max_scale;
   if (f.kind === "sim") sendSim();
   if (f.id === "font" || f.id === "char_auto") measure();
-  if (liveMode && (f.kind === "live" || f.id === "ramp_preset" || f.id === "char_auto" || f.id === "font")) applyLive();
+  if (liveMode && (f.kind === "live" || f.id === "ramp_preset" || f.id === "color_preset" || f.id === "char_auto" || f.id === "font")) applyLive();
   syncControls();
 }
 
@@ -515,12 +533,34 @@ function loop(now) {
   const t0 = performance.now();
   const len = W.frame(dt, cols, rows, achieved, lastRender);
   const text = dec.decode(new Uint8Array(W.memory.buffer, W.output_ptr(), len));
+  const ncol = W.colors_len();
+  paint(text, ncol ? new Uint32Array(W.memory.buffer, W.colors_ptr(), ncol) : null);
   lastRender = (performance.now() - t0) / 1000;
   renderMs += (lastRender * 1000 - renderMs) * 0.1;
-  $("screen").textContent = text;
   hist.push([W.sim_load(), W.activity(), target / Math.max(1, values.fps_max)]);
   if (hist.length > 240) hist.shift();
   if (!$("panel").classList.contains("hidden")) { drawGraph(); status(target); }
+}
+
+// Monochrome: plain text. Colour: one <span> per run of equal colour
+// (colors[i] belongs to the i-th char of text; 0xFFFFFFFF = default).
+const ESC = { "&": "&amp;", "<": "&lt;", ">": "&gt;" };
+function paint(text, colors) {
+  const screen = $("screen");
+  if (!colors) { screen.textContent = text; return; }
+  const out = []; let i = 0, run = "", cur = -1;
+  const flush = () => {
+    if (!run) return;
+    out.push(cur === 0xFFFFFFFF ? run : `<span style="color:#${cur.toString(16).padStart(6, "0")}">${run}</span>`);
+    run = "";
+  };
+  for (const ch of text) {
+    const c = i < colors.length ? colors[i] : 0xFFFFFFFF; i++;
+    if (c !== cur && ch !== " " && ch !== "\n") { flush(); cur = c; }
+    run += ESC[ch] || ch;
+  }
+  flush();
+  screen.innerHTML = out.join("");
 }
 
 function status(target) {

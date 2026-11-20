@@ -6,6 +6,7 @@ pub mod ground;
 pub mod sdf;
 
 use glam::{Mat3A, Vec2, Vec3A};
+use serde::{Deserialize, Serialize};
 use std::f32::consts::{PI, TAU};
 
 use crate::metrics::Channel;
@@ -99,30 +100,11 @@ pub struct SlotLayout {
 /// order the rings. Within a ring, slots keep their `show` order, starting at
 /// the front (+z); odd rings are rotated half a step so solids interleave.
 pub fn ring_layout(rings: &[Option<u32>]) -> (Vec<Vec3A>, Vec<usize>) {
-    let mut assigned: Vec<u32> = vec![0; rings.len()];
-    let mut count = std::collections::BTreeMap::<u32, usize>::new();
-    for r in rings.iter().flatten() {
-        *count.entry(*r).or_default() += 1;
-    }
-    for (i, r) in rings.iter().enumerate() {
-        assigned[i] = match r {
-            Some(r) => *r,
-            None => {
-                let mut k = 0;
-                while count.get(&k).copied().unwrap_or(0) >= RING_CAPACITY {
-                    k += 1;
-                }
-                *count.entry(k).or_default() += 1;
-                k
-            }
-        };
-    }
-    let order: Vec<u32> = count.keys().copied().collect();
-    let compact: Vec<usize> = assigned.iter().map(|r| order.binary_search(r).unwrap_or(0)).collect();
+    let (compact, nrings) = assign_rings(rings);
 
     let mut radius_prev: Option<f32> = None;
-    let mut radii = Vec::with_capacity(order.len());
-    for k in 0..order.len() {
+    let mut radii = Vec::with_capacity(nrings);
+    for k in 0..nrings {
         let n = compact.iter().filter(|&&c| c == k).count();
         let chord = if n > 1 { SPACING / (2.0 * (PI / n as f32).sin()) } else { 0.0 };
         let r = match radius_prev {
@@ -147,6 +129,119 @@ pub fn ring_layout(rings: &[Option<u32>]) -> (Vec<Vec3A>, Vec<usize>) {
     (pos, compact)
 }
 
+/// `n` points spread evenly over the unit sphere (Fibonacci lattice),
+/// turned by `yaw` about the vertical axis.
+pub fn fibonacci_sphere(n: usize, yaw: f32) -> Vec<Vec3A> {
+    let golden = PI * (3.0 - 5f32.sqrt());
+    (0..n)
+        .map(|i| {
+            let y = 1.0 - 2.0 * (i as f32 + 0.5) / n as f32;
+            let r = (1.0 - y * y).max(0.0).sqrt();
+            let th = yaw + i as f32 * golden;
+            Vec3A::new(r * th.sin(), y, r * th.cos())
+        })
+        .collect()
+}
+
+fn min_gap(pos: &[Vec3A]) -> f32 {
+    let mut m = f32::MAX;
+    for i in 0..pos.len() {
+        for j in i + 1..pos.len() {
+            m = m.min((pos[i] - pos[j]).length());
+        }
+    }
+    m
+}
+
+/// Centres on concentric spherical shells (ring index = shell index, same
+/// assignment rules as [`ring_layout`]), around a centre raised so the lowest
+/// full-size solid clears the ground. Returns (centres, shell index, centre).
+pub fn shell_layout(rings: &[Option<u32>]) -> (Vec<Vec3A>, Vec<usize>, Vec3A) {
+    let (compact, nshells) = assign_rings(rings);
+    let mut dirs: Vec<Vec<Vec3A>> = Vec::with_capacity(nshells);
+    let mut radii: Vec<f32> = Vec::with_capacity(nshells);
+    let mut prev: Option<f32> = None;
+    for k in 0..nshells {
+        let n = compact.iter().filter(|&&c| c == k).count();
+        // Alternate shells are turned so solids don't line up radially.
+        let d = fibonacci_sphere(n, k as f32 * 0.9);
+        let fit = if n > 1 { SPACING / min_gap(&d) } else { 0.0 };
+        let r = match prev {
+            None if n == 1 => 0.0,
+            None => fit.max(MIN_RING_RADIUS),
+            Some(p) => fit.max(p + SPACING),
+        };
+        dirs.push(d);
+        radii.push(r);
+        prev = Some(r);
+    }
+    let outer = radii.last().copied().unwrap_or(0.0);
+    let centre = Vec3A::new(0.0, outer + BASE_RADIUS + HOVER, 0.0);
+    let mut pos = vec![centre; rings.len()];
+    let mut next = vec![0usize; nshells];
+    for (i, &k) in compact.iter().enumerate() {
+        pos[i] = centre + dirs[k][next[k]] * radii[k];
+        next[k] += 1;
+    }
+    (pos, compact, centre)
+}
+
+/// Compacted ring index per slot (explicit rings honoured, automatic slots
+/// fill from the inside), and the number of rings.
+fn assign_rings(rings: &[Option<u32>]) -> (Vec<usize>, usize) {
+    let mut assigned: Vec<u32> = vec![0; rings.len()];
+    let mut count = std::collections::BTreeMap::<u32, usize>::new();
+    for r in rings.iter().flatten() {
+        *count.entry(*r).or_default() += 1;
+    }
+    for (i, r) in rings.iter().enumerate() {
+        assigned[i] = match r {
+            Some(r) => *r,
+            None => {
+                let mut k = 0;
+                while count.get(&k).copied().unwrap_or(0) >= RING_CAPACITY {
+                    k += 1;
+                }
+                *count.entry(k).or_default() += 1;
+                k
+            }
+        };
+    }
+    let order: Vec<u32> = count.keys().copied().collect();
+    let compact: Vec<usize> = assigned.iter().map(|r| order.binary_search(r).unwrap_or(0)).collect();
+    (compact, order.len())
+}
+
+/// Where the solids go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Layout {
+    /// Concentric rings on the ground.
+    #[default]
+    Rings,
+    /// Concentric spherical shells floating above the ground.
+    Sphere,
+}
+
+impl std::str::FromStr for Layout {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "rings" | "ring" => Ok(Self::Rings),
+            "sphere" | "shells" => Ok(Self::Sphere),
+            _ => Err(format!("unknown layout '{s}' (rings|sphere)")),
+        }
+    }
+}
+
+/// Camera distance multiplier for the sphere layout.
+const SPHERE_FRAMING: f32 = 1.45;
+
+/// Focus mode: a solid must lead the current focus by this much activity...
+const FOCUS_MARGIN: f32 = 0.05;
+/// ...for this long (seconds) before the camera switches to it.
+const FOCUS_HOLD: f32 = 1.0;
+
 #[derive(Debug, Clone)]
 pub struct Scene {
     pub solids: Vec<Instance>,
@@ -168,14 +263,30 @@ pub struct Scene {
     pub ground: Ground,
     /// Top of the y-slab that contains every solid.
     pub slab_top: f32,
+    /// Rings: `ring_pos` is a ground point and solids rest on it. Sphere:
+    /// `ring_pos` is the solid's centre.
+    grounded: bool,
+    /// Slot the focus camera is on, and a challenger waiting out `FOCUS_HOLD`.
+    focus: Option<usize>,
+    challenger: Option<(usize, f32)>,
 }
 
 impl Scene {
     pub fn new(slots: &[SlotLayout], anim: &AnimParams, cam: &CameraParams) -> Self {
+        Self::with_layout(slots, anim, cam, Layout::Rings)
+    }
+
+    pub fn with_layout(slots: &[SlotLayout], anim: &AnimParams, cam: &CameraParams, layout: Layout) -> Self {
         let rings: Vec<Option<u32>> = slots.iter().map(|s| s.ring).collect();
-        let (ring_pos, ring_index) = ring_layout(&rings);
         let n = slots.len().max(1) as f32;
-        let centroid = ring_pos.iter().copied().fold(Vec3A::ZERO, |a, b| a + b) / n;
+        let (ring_pos, ring_index, centroid) = match layout {
+            Layout::Rings => {
+                let (p, idx) = ring_layout(&rings);
+                let c = p.iter().copied().fold(Vec3A::ZERO, |a, b| a + b) / n;
+                (p, idx, c)
+            }
+            Layout::Sphere => shell_layout(&rings),
+        };
         let extent = ring_pos.iter().map(|p| (*p - centroid).length()).fold(0.0, f32::max)
             + BASE_RADIUS * anim.max_scale;
         let k = extent / REF_EXTENT;
@@ -194,7 +305,10 @@ impl Scene {
             .collect();
         // Stagger initial orientations so the idle scene isn't uniform.
         let angles = (0..slots.len()).map(|i| (0.4 + 0.3 * i as f32, 0.7 * i as f32)).collect();
-        let rig = CameraRig::new(cam, centroid, extent);
+        // A sphere is as tall as it is wide; flat rings appear foreshortened,
+        // so the camera framing tuned for rings needs to back off for shells.
+        let frame_extent = if layout == Layout::Sphere { extent * SPHERE_FRAMING } else { extent };
+        let rig = CameraRig::new(cam, centroid, frame_extent);
         let mut s = Self {
             solids,
             angles,
@@ -214,6 +328,9 @@ impl Scene {
             // Rotation centre: the focal point the camera looks at, on the ground.
             ground: Ground::new(&GroundParams::default(), Vec2::new(centroid.x, centroid.z)),
             slab_top: 2.0 * BASE_RADIUS + HOVER,
+            grounded: layout == Layout::Rings,
+            focus: None,
+            challenger: None,
         };
         for i in 0..s.solids.len() {
             s.set_scale(i, anim.min_scale);
@@ -239,8 +356,45 @@ impl Scene {
         let inst = &mut self.solids[i];
         inst.scale = r;
         inst.inv_scale = 1.0 / r;
-        // Rest just above the ground at every scale so contact shadows stay visible.
-        inst.center = self.ring_pos[i] + Vec3A::new(0.0, r + HOVER, 0.0);
+        inst.center = if self.grounded {
+            // Rest just above the ground at every scale so contact shadows stay visible.
+            self.ring_pos[i] + Vec3A::new(0.0, r + HOVER, 0.0)
+        } else {
+            self.ring_pos[i]
+        };
+    }
+
+    /// Slot the focus camera is on (or heading to).
+    pub fn focused(&self) -> Option<usize> {
+        self.focus
+    }
+
+    /// Track the busiest available solid, with hysteresis so the camera
+    /// doesn't flick between near-equal solids.
+    fn update_focus(&mut self, channels: &[Channel], dt: f32) {
+        let level = |i: usize| channels.get(i).filter(|c| c.available).map_or(0.0, |c| c.level.clamp(0.0, 1.0));
+        let n = self.solids.len();
+        let Some(best) = (0..n).max_by(|&a, &b| level(a).total_cmp(&level(b))) else { return };
+        match self.focus {
+            None => {
+                if level(best) > 0.01 {
+                    self.focus = Some(best);
+                }
+            }
+            Some(cur) if best != cur && level(best) > level(cur) + FOCUS_MARGIN => {
+                let held = match self.challenger {
+                    Some((c, t)) if c == best => t + dt,
+                    _ => dt,
+                };
+                if held >= FOCUS_HOLD {
+                    self.focus = Some(best);
+                    self.challenger = None;
+                } else {
+                    self.challenger = Some((best, held));
+                }
+            }
+            Some(_) => self.challenger = None,
+        }
     }
 
     fn refresh_transforms(&mut self) {
@@ -268,7 +422,9 @@ impl Scene {
             *y = (*y + yaw_rate * dt).rem_euclid(TAU);
         }
         self.refresh_transforms();
-        self.rig.advance(dt);
+        self.update_focus(channels, dt);
+        let target = self.focus.and_then(|i| self.solids.get(i)).map(|s| s.center);
+        self.rig.advance(dt, target);
         self.camera = self.rig.camera();
         self.ground.advance(dt);
     }
@@ -327,6 +483,75 @@ mod tests {
         assert!(r1 >= r0 + SPACING - 1e-4, "outer ring outside inner: {r0} {r1}");
         assert!((pos[1].length() - pos[2].length()).abs() < 1e-5);
         assert!(min_gap(&pos) >= SPACING - 1e-3);
+    }
+
+    #[test]
+    fn sphere_shells_spaced_and_above_ground() {
+        for n in 1..=16 {
+            let (pos, shell, c) = shell_layout(&vec![None; n]);
+            if n > 1 {
+                assert!(min_gap(&pos) >= SPACING - 1e-3, "n={n}: {}", min_gap(&pos));
+            }
+            for p in &pos {
+                assert!(p.y - BASE_RADIUS >= HOVER - 1e-4, "n={n}: full-size solid clears the ground");
+            }
+            assert_eq!(shell.iter().filter(|&&s| s == 0).count(), n.min(RING_CAPACITY));
+            // every member of a shell is the same distance from the centre
+            for k in 0..=*shell.iter().max().unwrap() {
+                let r: Vec<f32> = (0..n).filter(|&i| shell[i] == k).map(|i| (pos[i] - c).length()).collect();
+                assert!(r.iter().all(|x| (x - r[0]).abs() < 1e-3), "n={n} shell {k}: {r:?}");
+            }
+        }
+        // explicit shells: 1 in the centre, 3 around it
+        let (pos, shell, c) = shell_layout(&[Some(0), Some(1), Some(1), Some(1)]);
+        assert_eq!(shell, vec![0, 1, 1, 1]);
+        assert!((pos[0] - c).length() < 1e-5);
+        assert!((pos[1] - c).length() >= SPACING - 1e-4);
+    }
+
+    #[test]
+    fn sphere_scene_keeps_centres_fixed() {
+        let anim = AnimParams::default();
+        let slots: Vec<SlotLayout> = (0..12).map(|i| SlotLayout { solid: SolidKind::ALL[i], ring: None }).collect();
+        let mut s = Scene::with_layout(&slots, &anim, &CameraParams::default(), Layout::Sphere);
+        let before: Vec<Vec3A> = s.solids.iter().map(|i| i.center).collect();
+        s.update(&full(12), &anim, 0.1);
+        for (a, b) in before.iter().zip(&s.solids) {
+            assert!((*a - b.center).length() < 1e-5, "scaling about a fixed centre");
+            assert!(b.center.y - b.scale >= HOVER - 1e-4);
+            assert!(b.center.y + b.scale <= s.slab_top);
+        }
+        assert!(s.centroid.y > 1.0, "shell centre is raised");
+        assert!("Sphere".parse::<Layout>().unwrap() == Layout::Sphere && "x".parse::<Layout>().is_err());
+    }
+
+    #[test]
+    fn focus_follows_busiest_with_hysteresis() {
+        let anim = AnimParams::default();
+        let cam = CameraParams { mode: camera::CameraMode::Focus, ..CameraParams::default() };
+        let slots: Vec<SlotLayout> = DEFAULT_SOLIDS.iter().map(|&solid| SlotLayout { solid, ring: None }).collect();
+        let mut s = Scene::new(&slots, &anim, &cam);
+        let ch = |levels: [f32; 5]| -> Vec<Channel> {
+            levels.iter().map(|&l| Channel { available: true, level: l, spin_y: 0.0, spin_x: 0.0, activity: l }).collect()
+        };
+        s.update(&ch([0.2, 0.9, 0.1, 0.0, 0.3]), &anim, 0.1);
+        assert_eq!(s.focused(), Some(1));
+        // slightly busier: within the margin, never switches
+        for _ in 0..30 {
+            s.update(&ch([0.2, 0.9, 0.1, 0.0, 0.93]), &anim, 0.1);
+        }
+        assert_eq!(s.focused(), Some(1));
+        // clearly busier, but must hold for FOCUS_HOLD
+        s.update(&ch([0.2, 0.5, 0.1, 0.0, 0.95]), &anim, 0.5);
+        assert_eq!(s.focused(), Some(1));
+        s.update(&ch([0.2, 0.5, 0.1, 0.0, 0.95]), &anim, 0.6);
+        assert_eq!(s.focused(), Some(4));
+        // the camera ends up looking at it
+        for _ in 0..100 {
+            s.update(&ch([0.2, 0.5, 0.1, 0.0, 0.95]), &anim, 0.1);
+        }
+        let to = (s.solids[4].center - s.camera.pos).normalize();
+        assert!(s.camera.forward.dot(to) > 0.999);
     }
 
     #[test]

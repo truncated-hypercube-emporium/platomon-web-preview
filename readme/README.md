@@ -1,4 +1,4 @@
-# platomon 1.2.1
+# platomon 1.3
 
 A terminal system monitor: one path-traced polyhedron per metric, rendered in monochrome ASCII on
 concentric rings. Each solid's scale and spin follow its metric; the frame rate (5–150 fps) follows
@@ -38,11 +38,13 @@ The settings panel (`g`) covers every option and shows each one's scope:
 | Tag | When it takes effect |
 |---|---|
 | **instant** | simulated load: profile (`cycle`, `bursts`, `ramp`, `steps`, `idle`, `stress`, `manual`), speed, manual level, seed |
-| **live** | display, legend & wireframe, frame rate, rendering, background, animation — applied as you change them |
-| **on Apply** | metrics, solids, rings, camera, smoothing, sensor rate — **Apply & restart** rebuilds the scene |
+| **live** | display, legend & wireframe, colour, frame rate, rendering, background, animation — applied as you change them |
+| **on Apply** | metrics, solids, rings, layout, camera (incl. focus zoom / glide), smoothing, sensor rate — **Apply & restart** rebuilds the scene |
 
 Switch the panel to **On Apply only** to hold every change until Apply. Changed-but-not-applied
 settings are highlighted, and the panel shows the equivalent desktop command and `config.toml`.
+Colour gradients are drawn as coloured text; with `256` depth the page shows the xterm palette entry a
+256-colour terminal would use.
 The simulated machine has adapters `Ethernet`, `Wi-Fi`, `vEthernet` and disks `C:\`, `D:\`, `E:\`.
 Browsers cap drawing at the display's refresh rate and throttle hidden tabs.
 
@@ -56,7 +58,7 @@ platomon [OPTIONS]
 |---|---|---|
 | **General** | | |
 | `--config` | `PATH` | `<config dir>/platomon/config.toml` if present |
-| `--list` | `solids\|metrics\|aspects\|sensors\|patterns` | prints IDs (sensors: this machine's disks/adapters) and exits |
+| `--list` | `solids\|metrics\|aspects\|sensors\|patterns\|gradients` | prints IDs (sensors: this machine's disks/adapters; gradients: colour swatches) and exits |
 | `--print-config` | flag | print effective config as TOML |
 | `--snapshot` | `COLSxROWS` | render one frame to stdout, no terminal needed |
 | `--snapshot-time` | seconds of animation to simulate first | 0.3 |
@@ -65,7 +67,8 @@ platomon [OPTIONS]
 | **Metrics & solids** | | |
 | `--show` | `METRIC[,METRIC…]`, max 16 | `cpu,ram,disk,net,gpu` |
 | `--solid` | `METRIC=SOLID`, repeatable | built-in mapping |
-| `--ring` | `METRIC=N`, repeatable (0 = innermost) | automatic |
+| `--ring` | `METRIC=N`, repeatable (0 = innermost ring or shell) | automatic |
+| `--layout` | `rings` (on the ground) or `sphere` (concentric spherical shells) | `rings` |
 | **Rendering** | | |
 | `--spp` | `N` (1–64) | 2 |
 | `--bounces` | `N` (0–8) | 2 |
@@ -77,7 +80,9 @@ platomon [OPTIONS]
 | `--aspect` | `fill`, preset or `W:H` | `fill` |
 | `--aspect-mode` | `letterbox\|crop` | `letterbox` |
 | **Camera** | | |
-| `--camera` | `static\|orbit` | `static` |
+| `--camera` | `static\|orbit\|focus` (focus: glide toward the busiest solid) | `static` |
+| `--focus-zoom` | `0..1`: 0 = only turn toward the busiest solid, 1 = close-up | 0.6 |
+| `--focus-tau` | glide time constant, seconds | 1.5 |
 | `--orbit-period` | seconds per revolution | 60 |
 | `--orbit-dir` | `random\|cw\|ccw` (seen from above) | `random` |
 | `--orbit-radius` | world units | fit to layout |
@@ -100,11 +105,65 @@ platomon [OPTIONS]
 | `--legend-opacity` | `0..1` panel background: 0 = see-through, 1 = solid | 0.85 |
 | `--legend-pos` | `tl\|tr\|bl\|br` (or `top-left`, …) | `tl` |
 | `--wireframe` | flag: each solid's visible edges drawn in inverted luminosity | off |
+| **Colour** | | |
+| `--color` | `off`, a preset (`--list gradients`) or 2+ hex stops, e.g. `"#000:#f80:#fff"` | `off` |
+| `--color-by` | `lum` (brightness → gradient) or `load` (each solid by its metric) | `lum` |
+| `--color-depth` | `24bit` or `256` (xterm palette, for older terminals) | `24bit` |
+| `--color-reverse` | flag: run the gradient backwards | off |
 
-Any `--legend-*` option turns the legend on.
+Any `--legend-*` option turns the legend on. `--color-by` or `--color-reverse` without `--color`
+picks a default gradient: `inferno` for `lum`, `traffic` for `load`.
 
 The orbit circles the centroid of all solids and advances with wall-clock time, so its speed doesn't
 depend on fps.
+
+### Focus camera
+
+`--camera focus` starts from the static overview and glides toward whichever solid's metric is
+busiest, looking straight at it. It moves along the line from that solid back to the overview
+position: `--focus-zoom 0` stays at overview distance and only turns, `1` comes in to a close-up
+(5 units from the solid's centre). Movement is exponentially smoothed with `--focus-tau` seconds.
+To stop the camera darting between near-equal metrics, a new solid must lead the current one by 5
+percentage points for a full second before the camera switches.
+
+### Sphere layout
+
+`--layout sphere` places the solids on concentric spherical shells instead of rings on the ground.
+`--ring` (and automatic placement, 8 per shell) picks the shell; each shell spreads its solids
+evenly (a Fibonacci lattice) and is sized so neighbours keep the same spacing as on the rings. The
+whole cluster floats just above the ground plane, so the background, its patterns and contact
+shadows still work; the camera frames it from further back. Solids grow and shrink about fixed
+centres rather than resting on the ground.
+
+### Colour
+
+Colour is off by default (pure monochrome). `--color GRADIENT` maps each cell through a gradient,
+using one of two sources:
+
+- `--color-by lum`: the cell's brightness, so dark glyphs take the first stop and bright glyphs the
+  last. One colour per glyph level, so colour changes only where the glyph does.
+- `--color-by load`: each solid takes the colour at its metric's load (idle = first stop, full =
+  last stop), shaded by brightness. The background and legend text keep the terminal's default
+  colour; legend icons take their solid's colour.
+
+| Gradient | Colours |
+|---|---|
+| `inferno` | black, purple, red, orange, pale yellow |
+| `viridis` | purple, blue, teal, green, yellow |
+| `plasma` | indigo, magenta, orange, yellow |
+| `fire` | black, deep red, orange, gold, white |
+| `ice` | navy, blue, cyan, white |
+| `ocean` | deep blue to aqua |
+| `sunset` | violet, magenta, coral, gold |
+| `matrix` | phosphor green |
+| `amber` | amber monochrome monitor |
+| `grey` | neutral grey ramp |
+| `traffic` | green, yellow, red (made for `--color-by load`) |
+| `rainbow` | red through violet |
+
+Custom gradients take two or more hex stops (`#rgb` or `#rrggbb`, `#` optional), evenly spaced,
+separated by `:`, `,`, `;`, `/` or spaces. Colour escapes add to the bytes written per frame,
+so very large grids on slow consoles may lose some fps; `--color-depth 256` is a little shorter.
 
 ### Luminosity levels
 
@@ -264,6 +323,20 @@ platomon --bg-pattern brick --bg-sway 0.6 --bg-sway-period 6           # floor s
 platomon --bg-pattern triangles --bg-scale 0.6 --bg-contrast 1 --bg-scroll -0.5:0
 platomon --bg-pattern radial --bg-rotate ccw --bg-rotate-period 20 --camera orbit --orbit-dir cw   # floor and camera turn against each other
 platomon --bg-pattern diamond --bg-rotate cw --bg-rotate-period 30 --bg-scroll 0.4:0 --bg-sway 0.5 # rotate, scroll and sway at once
+```
+
+**Focus camera, sphere layout and colour**
+
+```
+platomon --camera focus                                                # glide toward the busiest solid
+platomon --camera focus --focus-zoom 1 --focus-tau 3                   # slow, full close-ups
+platomon --layout sphere --show "cpu,ram,disk,net,gpu,nic,disk-dev"    # one shell of 7
+platomon --layout sphere --ring cpu=0 --ring ram=1 --ring disk=1 --ring net=1 --ring gpu=1   # CPU at the centre of a shell
+platomon --color inferno                                               # brightness through inferno
+platomon --color-by load                                               # each solid green → red with its load (traffic)
+platomon --color viridis --color-by load --color-depth 256             # 256-colour terminals
+platomon --color "#001020:#0080ff:#ffffff" --bg-lum 1                  # custom three-stop gradient
+platomon --layout sphere --camera focus --color-by load --legend --wireframe   # everything at once
 ```
 
 **Legend and wireframe**

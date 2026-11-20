@@ -6,6 +6,7 @@ use std::hint::black_box;
 
 use platomon::ascii::{self, Ramp};
 use platomon::aspect::Viewport;
+use platomon::color::{ColorBy, ColorDepth, ColorMap, Gradient};
 use platomon::metrics::Channel;
 use platomon::overlay::{LegendParams, LegendPos, OverlayOptions, Overlays};
 use platomon::render::{QualityGovernor, RenderSettings, Renderer};
@@ -82,7 +83,7 @@ fn bench(c: &mut Criterion) {
     c.bench_function("wqhd_640x240_ascii_compose_only", |b| {
         b.iter(|| {
             let cells = ascii::glyphs(&buf, &ramp, 1.0);
-            ascii::compose_terminal(&cells, &vp, (bw, bh), None, &mut out);
+            ascii::compose_terminal(&cells, None, &vp, (bw, bh), None, &mut out);
             black_box(out.len())
         })
     });
@@ -97,11 +98,26 @@ fn bench(c: &mut Criterion) {
         char_aspect: 4.0 / 6.0,
         ramp: &ramp,
         exposure: 1.0,
+        color: None,
+        levels: &[],
     };
     c.bench_function("wqhd_640x240_overlays_wireframe_legend", |b| {
         b.iter(|| {
             let view = r.view().unwrap();
-            black_box(overlays.compose(&view, bw, bh, &big, &opt).len())
+            black_box(overlays.compose(&view, bw, bh, &big, &opt).chars.len())
+        })
+    });
+    // Colour: lum gradient composed to 24-bit escapes.
+    let cm = ColorMap { gradient: Gradient::parse("inferno").unwrap(), by: ColorBy::Lum, depth: ColorDepth::True };
+    let levels = vec![0.5; 16];
+    let copt = OverlayOptions { wireframe: false, legend: None, color: Some(&cm), levels: &levels, ..opt };
+    let mut out = String::with_capacity(bw * bh * 8);
+    c.bench_function("wqhd_640x240_color_lum_compose", |b| {
+        b.iter(|| {
+            let view = r.view().unwrap();
+            let cells = overlays.compose(&view, bw, bh, &big, &copt);
+            ascii::compose_terminal(cells.chars, cells.colors.map(|c| (c, cm.depth)), &vp, (bw, bh), None, &mut out);
+            black_box(out.len())
         })
     });
 
@@ -113,7 +129,7 @@ fn bench(c: &mut Criterion) {
         b.iter(|| {
             let buf = r.render(&scene, w, h, &settings);
             let cells = ascii::glyphs(buf, &ramp, 1.0);
-            ascii::compose_terminal(&cells, &vp, (w, h), None, &mut out);
+            ascii::compose_terminal(&cells, None, &vp, (w, h), None, &mut out);
             black_box(out.len())
         })
     });

@@ -3,6 +3,7 @@
 use std::fmt::Write as _;
 
 use crate::aspect::Viewport;
+use crate::color::{self, ColorDepth};
 
 /// Default ramp: 16 luminance levels, ordered by glyph ink coverage.
 pub const DEFAULT_RAMP: &str = " .,:;-~=+*ox#%&@";
@@ -29,13 +30,18 @@ impl Ramp {
         self.chars.is_empty()
     }
 
-    /// `lum` in 0..=1 → glyph; bucket `i` covers `[i/n, (i+1)/n)`.
+    /// `lum` in 0..=1 → bucket index; bucket `i` covers `[i/n, (i+1)/n)`.
     #[inline(always)]
-    pub fn glyph(&self, lum: f32) -> char {
+    pub fn level(&self, lum: f32) -> usize {
         let n = self.chars.len();
         let l = if lum.is_finite() { lum.clamp(0.0, 1.0) } else { 0.0 };
-        let i = ((l * n as f32) as usize).min(n - 1);
-        self.chars[i]
+        ((l * n as f32) as usize).min(n - 1)
+    }
+
+    /// `lum` in 0..=1 → glyph.
+    #[inline(always)]
+    pub fn glyph(&self, lum: f32) -> char {
+        self.chars[self.level(lum)]
     }
 }
 
@@ -74,16 +80,42 @@ pub fn glyphs(buf: &[f32], ramp: &Ramp, exposure: f32) -> Vec<char> {
     buf.iter().map(|&v| ramp.glyph(tone_map(v, exposure))).collect()
 }
 
+/// Per-cell colours (`0xRRGGBB` or [`color::NONE`]) and the escape depth.
+pub type Colors<'a> = Option<(&'a [u32], ColorDepth)>;
+
+/// Push one row of glyphs, switching colour only where it changes. Leaves
+/// the default colour set.
+fn push_row(out: &mut String, cells: &[char], colors: Option<(&[u32], ColorDepth)>) {
+    let Some((cols, depth)) = colors else {
+        out.extend(cells);
+        return;
+    };
+    let mut cur = color::NONE;
+    for (i, &c) in cells.iter().enumerate() {
+        let col = cols.get(i).copied().unwrap_or(color::NONE);
+        if col != cur && c != ' ' {
+            color::push_sgr(out, col, depth);
+            cur = col;
+        }
+        out.push(c);
+    }
+    if cur != color::NONE {
+        color::push_sgr(out, color::NONE, depth);
+    }
+}
+
 /// Rows of the `w × h` glyph grid joined by `'\n'` (no trailing newline).
-pub fn compose_plain(cells: &[char], w: usize, h: usize, out: &mut String) {
+pub fn compose_plain(cells: &[char], colors: Colors<'_>, w: usize, h: usize, out: &mut String) {
     out.clear();
     for y in 0..h {
         if y > 0 {
             out.push('\n');
         }
-        for x in 0..w {
-            out.push(cells.get(y * w + x).copied().unwrap_or(' '));
-        }
+        let lo = (y * w).min(cells.len());
+        let hi = ((y + 1) * w).min(cells.len());
+        let row_colors = colors.map(|(c, d)| (&c[lo.min(c.len())..hi.min(c.len())], d));
+        push_row(out, &cells[lo..hi], row_colors);
+        out.extend(std::iter::repeat_n(' ', w - (hi - lo)));
     }
 }
 
@@ -102,6 +134,7 @@ pub struct StatsLine<'a> {
 /// for a single `write_all`.
 pub fn compose_terminal(
     cells: &[char],
+    colors: Colors<'_>,
     vp: &Viewport,
     (cols, rows): (usize, usize),
     stats: Option<StatsLine<'_>>,
@@ -115,7 +148,8 @@ pub fn compose_terminal(
         if ty >= vp.y && ty < vp.y + vp.h && w > 0 {
             let y = ty - vp.y;
             out.extend(std::iter::repeat_n(' ', vp.x));
-            out.extend(&cells[y * w..(y + 1) * w]);
+            let row = y * w..(y + 1) * w;
+            push_row(out, &cells[row.clone()], colors.map(|(c, d)| (&c[row], d)));
             out.extend(std::iter::repeat_n(' ', right));
         } else {
             out.extend(std::iter::repeat_n(' ', cols));
@@ -194,7 +228,7 @@ mod tests {
         let (w, h) = (17, 5);
         let buf = vec![0.5; w * h];
         let mut s = String::new();
-        compose_plain(&glyphs(&buf, &Ramp::default(), 1.0), w, h, &mut s);
+        compose_plain(&glyphs(&buf, &Ramp::default(), 1.0), None, w, h, &mut s);
         assert_eq!(s.chars().count(), w * h + (h - 1));
         assert_eq!(s.lines().count(), h);
         assert!(s.lines().all(|l| l.chars().count() == w));
@@ -210,14 +244,14 @@ mod tests {
         let vp = Viewport { x: 0, y: 0, w, h, fit: None };
         let buf = vec![' '; w * h];
         let mut s = String::new();
-        compose_terminal(&buf, &vp, (w, h), stats("CPU 1% | a very long stats line", 3, 8), &mut s);
+        compose_terminal(&buf, None, &vp, (w, h), stats("CPU 1% | a very long stats line", 3, 8), &mut s);
         assert!(s.starts_with("\x1b[1;1H"));
         assert!(s.ends_with("\x1b[4;1HCPU 1% |"), "stats truncated to width: {s:?}");
         let glyphs: usize =
             s.split("\x1b[").skip(1).take(h).map(|seg| seg.split_once('H').unwrap().1.chars().count()).sum();
         assert_eq!(glyphs, w * h);
 
-        compose_terminal(&buf, &vp, (w, h), stats("ab", 3, 8), &mut s);
+        compose_terminal(&buf, None, &vp, (w, h), stats("ab", 3, 8), &mut s);
         assert!(s.ends_with("\x1b[4;1Hab      "), "stats padded to width");
     }
 
@@ -226,7 +260,20 @@ mod tests {
         // 7×4 area, 3×2 picture at (2,1)
         let vp = Viewport { x: 2, y: 1, w: 3, h: 2, fit: Some(1.0) };
         let mut s = String::new();
-        compose_terminal(&glyphs(&[1e9; 6], &Ramp::default(), 1.0), &vp, (7, 4), None, &mut s);
+        compose_terminal(&glyphs(&[1e9; 6], &Ramp::default(), 1.0), None, &vp, (7, 4), None, &mut s);
         assert_eq!(s, "\x1b[1;1H       \x1b[2;1H  @@@  \x1b[3;1H  @@@  \x1b[4;1H       ");
+    }
+
+    #[test]
+    fn colours_switch_only_on_change_and_reset_each_row() {
+        let vp = Viewport { x: 1, y: 0, w: 4, h: 1, fit: None };
+        let cells = ['a', 'b', ' ', 'c'];
+        let cols = [0xff0000, 0xff0000, 0x00ff00, color::NONE];
+        let mut s = String::new();
+        compose_terminal(&cells, Some((&cols, ColorDepth::True)), &vp, (6, 1), None, &mut s);
+        // one code for the red run, none for the blank (no visible ink), reset for 'c'
+        assert_eq!(s, "\x1b[1;1H \x1b[38;2;255;0;0mab \x1b[39mc ");
+        compose_plain(&cells, Some((&cols, ColorDepth::Ansi256)), 4, 1, &mut s);
+        assert_eq!(s, "\x1b[38;5;196mab \x1b[39mc");
     }
 }

@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
 use crate::ascii::{self, Ramp};
+use crate::color::{self, ColorBy, ColorMap};
 use crate::render::FrameView;
 use crate::scene::Scene;
 use crate::scene::sdf::SolidKind;
@@ -257,15 +258,26 @@ fn layout(p: &LegendParams, w: usize, h: usize, labels: &[String], char_aspect: 
 
 struct Grid<'a> {
     cells: &'a mut [char],
+    /// Per-cell colour, when colour is on; `put` paints `ink`.
+    colors: Option<&'a mut [u32]>,
+    ink: u32,
     w: usize,
     h: usize,
 }
 
-impl Grid<'_> {
+impl<'a> Grid<'a> {
+    fn new(cells: &'a mut [char], w: usize, h: usize) -> Self {
+        Self { cells, colors: None, ink: color::NONE, w, h }
+    }
+
     #[inline]
     fn put(&mut self, x: isize, y: isize, c: char) {
         if x >= 0 && y >= 0 && (x as usize) < self.w && (y as usize) < self.h {
-            self.cells[y as usize * self.w + x as usize] = c;
+            let i = y as usize * self.w + x as usize;
+            self.cells[i] = c;
+            if let Some(cols) = self.colors.as_deref_mut() {
+                cols[i] = self.ink;
+            }
         }
     }
 
@@ -351,6 +363,7 @@ pub struct Overlays {
     mask: Vec<bool>,
     lum: Vec<f32>,
     cells: Vec<char>,
+    colors: Vec<u32>,
 }
 
 /// What to draw this frame.
@@ -362,15 +375,54 @@ pub struct OverlayOptions<'a> {
     pub char_aspect: f32,
     pub ramp: &'a Ramp,
     pub exposure: f32,
+    /// Colour gradient mapping; `None` = monochrome.
+    pub color: Option<&'a ColorMap>,
+    /// Each slot's load 0..=1 (for `--color-by load`).
+    pub levels: &'a [f32],
+}
+
+/// The composed picture: glyphs and, when colour is on, per-cell colours.
+pub struct Cells<'a> {
+    pub chars: &'a [char],
+    pub colors: Option<&'a [u32]>,
+}
+
+/// Brightness of `--color-by load` colours for glyph bucket `b` of `n`:
+/// never fully black, so the hue stays readable on dark faces.
+fn load_shade(b: usize, n: usize) -> f32 {
+    0.35 + 0.65 * (b as f32 + 0.5) / n as f32
 }
 
 impl Overlays {
     pub fn new(scene: &Scene) -> Self {
         let wires = scene.solids.iter().map(|s| Wire::new(s.poly.kind())).collect();
-        Self { wires, mask: Vec::new(), lum: Vec::new(), cells: Vec::new() }
+        Self { wires, mask: Vec::new(), lum: Vec::new(), cells: Vec::new(), colors: Vec::new() }
     }
 
-    /// Tone-map the frame, apply the overlays and return the `w × h` glyph grid.
+    /// Fill `self.colors` from the final luminances.
+    fn colorize(&mut self, cm: &ColorMap, frame: &FrameView<'_>, ramp: &Ramp, levels: &[f32]) {
+        let n = ramp.len();
+        self.colors.clear();
+        match cm.by {
+            ColorBy::Lum => {
+                let table: Vec<u32> = (0..n).map(|b| cm.gradient.sample((b as f32 + 0.5) / n as f32, 1.0)).collect();
+                self.colors.extend(self.lum.iter().map(|&l| table[ramp.level(l)]));
+            }
+            ColorBy::Load => {
+                // slot × bucket table
+                let table: Vec<Vec<u32>> = levels
+                    .iter()
+                    .map(|&lv| (0..n).map(|b| cm.gradient.sample(lv, load_shade(b, n))).collect())
+                    .collect();
+                self.colors.extend(self.lum.iter().enumerate().map(|(i, &l)| {
+                    let id = frame.ids.get(i).copied().unwrap_or(crate::render::NO_HIT) as usize;
+                    table.get(id).map_or(color::NONE, |t| t[ramp.level(l)])
+                }));
+            }
+        }
+    }
+
+    /// Tone-map the frame, apply the overlays and return the `w × h` grid.
     pub fn compose(
         &mut self,
         frame: &FrameView<'_>,
@@ -378,7 +430,7 @@ impl Overlays {
         h: usize,
         scene: &Scene,
         opt: &OverlayOptions<'_>,
-    ) -> &[char] {
+    ) -> Cells<'_> {
         let ramp = opt.ramp;
         ascii::tone_buffer(frame.radiance, opt.exposure, &mut self.lum);
         self.lum.resize(w * h, 0.0);
@@ -395,11 +447,30 @@ impl Overlays {
             }
         }
         ascii::shade(&self.lum, ramp, &mut self.cells);
-        if let Some((_, panel)) = &panel {
-            let mut g = Grid { cells: &mut self.cells, w, h };
-            draw_legend(&mut g, panel, &self.wires, scene, opt.labels, ramp, opt.char_aspect);
+        if let Some(cm) = opt.color {
+            self.colorize(cm, frame, ramp, opt.levels);
+            if let Some((_, panel)) = &panel {
+                // Panel background stays uncoloured so labels read clearly.
+                for y in panel.y..panel.y + panel.h {
+                    self.colors[y * w + panel.x..y * w + panel.x + panel.w].fill(color::NONE);
+                }
+            }
         }
-        &self.cells
+        if let Some((_, panel)) = &panel {
+            let mut g = Grid::new(&mut self.cells, w, h);
+            if opt.color.is_some() {
+                g.colors = Some(&mut self.colors);
+            }
+            let icon_ink = |slot: usize| match opt.color {
+                Some(cm) if cm.by == ColorBy::Load => {
+                    cm.gradient.sample(opt.levels.get(slot).copied().unwrap_or(0.0), 1.0)
+                }
+                Some(cm) => cm.gradient.sample(1.0, 1.0),
+                None => color::NONE,
+            };
+            draw_legend(&mut g, panel, &self.wires, scene, opt, &icon_ink);
+        }
+        Cells { chars: &self.cells, colors: opt.color.is_some().then_some(&self.colors[..]) }
     }
 
     /// Mark every visible edge cell of every solid and invert its luminosity.
@@ -460,10 +531,10 @@ fn draw_legend(
     panel: &Panel,
     wires: &[Wire],
     scene: &Scene,
-    labels: &[String],
-    ramp: &Ramp,
-    char_aspect: f32,
+    opt: &OverlayOptions<'_>,
+    icon_ink: &dyn Fn(usize) -> u32,
 ) {
+    let (labels, ramp, char_aspect) = (opt.labels, opt.ramp, opt.char_aspect);
     let cam = scene.camera;
     let toward = -cam.forward;
     let ink = ramp.glyph(1.0);
@@ -488,6 +559,7 @@ fn draw_legend(
             .collect();
         let front: Vec<bool> = wire.faces.iter().map(|&(n, _)| (rot * n).dot(toward) > 0.0).collect();
         let clip = (ex as isize, ey as isize, (ex + iw) as isize, (ey + ih) as isize);
+        g.ink = icon_ink(slot);
         // Hidden edges first (dotted, only on blank cells), then visible ones on top.
         for pass in 0..2 {
             for &(a, b, f1, f2) in &wire.edges {
@@ -506,6 +578,7 @@ fn draw_legend(
         }
         // Label, vertically centred on the icon.
         let label = labels.get(slot).map(String::as_str).unwrap_or("");
+        g.ink = color::NONE;
         let lx = ex + iw + 1;
         let ly = ey + (ih.saturating_sub(panel.font.height())) / 2;
         draw_text(g, lx, ly, panel.label_w, label, &panel.font, ink);
@@ -574,25 +647,97 @@ mod tests {
         assert_eq!((f.scale, f.px_w, f.height()), (3, 3, 15));
         assert_eq!(Font::for_size(2, 0.5).width("CPU 5%"), 6);
         let mut cells = vec![' '; 8 * 5];
-        draw_text(&mut Grid { cells: &mut cells, w: 8, h: 5 }, 0, 0, 8, "T1", &Font::for_size(3, 0.5), '#');
+        draw_text(&mut Grid::new(&mut cells, 8, 5), 0, 0, 8, "T1", &Font::for_size(3, 0.5), '#');
         let rows: Vec<String> = cells.chunks(8).map(|r| r.iter().collect()).collect();
         assert_eq!(rows, ["###  #  ", " #  ##  ", " #   #  ", " #   #  ", " #  ### "]);
     }
 
-    fn frame_with(wireframe: bool, legend: Option<&LegendParams>) -> (Vec<char>, Vec<char>) {
+    const W: usize = 100;
+    const H: usize = 34;
+
+    /// (plain glyphs, overlaid glyphs, colours, ids)
+    fn frame_full(
+        wireframe: bool,
+        legend: Option<&LegendParams>,
+        color: Option<&ColorMap>,
+    ) -> (Vec<char>, Vec<char>, Option<Vec<u32>>, Vec<u8>) {
         let scene = Scene::demo(&AnimParams::default());
-        let (w, h) = (100, 34);
         let mut r = Renderer::new();
         let rs = RenderSettings { spp: 1, ..RenderSettings::default() };
-        r.render(&scene, w, h, &rs);
+        r.render(&scene, W, H, &rs);
         let view = r.view().unwrap();
         let ramp = Ramp::default();
         let plain = ascii::glyphs(view.radiance, &ramp, 1.0);
         let mut o = Overlays::new(&scene);
         let labels = labels(scene.solids.len());
-        let opt = OverlayOptions { wireframe, legend, labels: &labels, char_aspect: 0.5, ramp: &ramp, exposure: 1.0 };
-        let out = o.compose(&view, w, h, &scene, &opt).to_vec();
-        (plain, out)
+        let levels = [0.0, 0.25, 0.5, 0.75, 1.0];
+        let opt = OverlayOptions {
+            wireframe,
+            legend,
+            labels: &labels,
+            char_aspect: 0.5,
+            ramp: &ramp,
+            exposure: 1.0,
+            color,
+            levels: &levels,
+        };
+        let out = o.compose(&view, W, H, &scene, &opt);
+        (plain, out.chars.to_vec(), out.colors.map(<[u32]>::to_vec), view.ids.to_vec())
+    }
+
+    fn frame_with(wireframe: bool, legend: Option<&LegendParams>) -> (Vec<char>, Vec<char>) {
+        let (p, o, _, _) = frame_full(wireframe, legend, None);
+        (p, o)
+    }
+
+    #[test]
+    fn lum_colours_follow_glyph_brightness() {
+        let cm = ColorMap {
+            gradient: crate::color::Gradient::parse("grey").unwrap(),
+            by: ColorBy::Lum,
+            depth: crate::color::ColorDepth::True,
+        };
+        let (_, chars, cols, _) = frame_full(false, None, Some(&cm));
+        let cols = cols.expect("colours on");
+        let ramp: Vec<char> = crate::ascii::DEFAULT_RAMP.chars().collect();
+        for (c, col) in chars.iter().zip(&cols) {
+            let b = ramp.iter().position(|r| r == c).unwrap();
+            assert_eq!(*col & 0xff, ((b as f32 + 0.5) / 16.0 * 255.0).round() as u32, "glyph {c:?}");
+        }
+        let (_, _, none, _) = frame_full(false, None, None);
+        assert!(none.is_none(), "monochrome has no colour buffer");
+    }
+
+    #[test]
+    fn load_colours_solids_only_and_legend_is_plain() {
+        let cm = ColorMap {
+            gradient: crate::color::Gradient::parse("#000000:#ff0000").unwrap(),
+            by: ColorBy::Load,
+            depth: crate::color::ColorDepth::True,
+        };
+        let (_, _, cols, ids) = frame_full(false, None, Some(&cm));
+        let cols = cols.unwrap();
+        for (i, (&col, &id)) in cols.iter().zip(&ids).enumerate() {
+            if (id as usize) < 5 {
+                assert_eq!(col & 0x00ffff, 0, "pure red hue at {i}");
+                if id == 0 {
+                    assert_eq!(col, 0, "slot 0 is idle → first stop (black)");
+                }
+            } else {
+                assert_eq!(col, color::NONE, "background uncoloured at {i}");
+            }
+        }
+        assert!(cols.iter().any(|&c| c != color::NONE && c >> 16 > 0x80), "busy solids are bright red");
+
+        // opaque legend: panel is uncoloured except icon strokes in the slot colour
+        let p = LegendParams { size: 2, opacity: 1.0, pos: LegendPos::TopLeft };
+        let (_, chars, cols, _) = frame_full(false, Some(&p), Some(&cm));
+        let cols = cols.unwrap();
+        let text: String = chars.chunks(W).map(|r| r.iter().collect::<String>() + "\n").collect();
+        let row = text.lines().position(|l| l.contains("CPU 4%")).unwrap();
+        let col = text.lines().nth(row).unwrap().find("CPU 4%").unwrap();
+        assert_eq!(cols[row * W + col], color::NONE, "label text in default colour");
+        assert!(cols.contains(&0xff0000), "slot 4 (full load) icon drawn in the last stop");
     }
 
     #[test]

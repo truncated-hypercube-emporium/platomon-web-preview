@@ -6,6 +6,7 @@
 pub mod ascii;
 pub mod aspect;
 pub mod clock;
+pub mod color;
 pub mod collector;
 pub mod config;
 pub mod metrics;

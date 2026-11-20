@@ -5,6 +5,8 @@
 //! frame it decides to draw and reads the text back from the output buffer.
 //! Sensors come from [`platomon::sim`], sampled at `poll_hz` like the real
 //! collector, so smoothing, peaks, activity and fps behave as on a machine.
+//! With a colour gradient on, [`colors_ptr`] / [`colors_len`] give one
+//! `0xRRGGBB` (or [`color::NONE`]) per character of the output text.
 
 use std::cell::RefCell;
 
@@ -12,6 +14,7 @@ use glam::Vec2;
 use platomon::ascii::{self, Ramp};
 use platomon::aspect::{self, AspectMode};
 use platomon::clock::{activity_to_fps, slew_limit};
+use platomon::color::{self, ColorDepth, ColorMap};
 use platomon::config::{Config, SlotSpec};
 use platomon::metrics::{MetricsState, activity_score};
 use platomon::overlay::{OverlayOptions, Overlays};
@@ -38,7 +41,11 @@ pub struct App {
     target: f32,
     activity: f32,
     labels: Vec<String>,
+    cmap: Option<ColorMap>,
+    levels: Vec<f32>,
     text: String,
+    /// One colour per char of `text` (newlines included); empty when monochrome.
+    colors: Vec<u32>,
 }
 
 fn anim_params(c: &Config) -> AnimParams {
@@ -54,7 +61,30 @@ fn camera_params(c: &Config) -> CameraParams {
         height: c.orbit_height,
         bob: c.orbit_bob,
         seed: c.seed,
+        focus_zoom: c.focus_zoom,
+        focus_tau: c.focus_tau,
     }
+}
+
+/// What the page should paint for `c`: the colour itself, or for 256-colour
+/// output the xterm palette entry the terminal would show.
+fn display_color(c: u32, depth: ColorDepth) -> u32 {
+    if c == color::NONE || depth == ColorDepth::True {
+        return c;
+    }
+    xterm256_rgb(color::ansi256(c))
+}
+
+/// RGB of an xterm-256 palette index (16..=255; lower ones are not produced).
+fn xterm256_rgb(i: u8) -> u32 {
+    let i = i as u32;
+    if i >= 232 {
+        let v = 8 + (i - 232) * 10;
+        return (v << 16) | (v << 8) | v;
+    }
+    const LEVELS: [u32; 6] = [0, 95, 135, 175, 215, 255];
+    let k = i.saturating_sub(16);
+    (LEVELS[(k / 36) as usize % 6] << 16) | (LEVELS[(k / 6) as usize % 6] << 8) | LEVELS[(k % 6) as usize]
 }
 
 /// Parse, sanitise and validate a config.
@@ -63,6 +93,7 @@ pub fn load(toml: &str) -> Result<(Config, Vec<SlotSpec>, Option<f32>), String> 
     cfg.sanitize();
     let slots = cfg.resolve_slots()?;
     let ratio = aspect::parse_aspect(&cfg.aspect)?;
+    cfg.color_map().map_err(|e| format!("color: {e}"))?;
     Ok((cfg, slots, ratio))
 }
 
@@ -71,7 +102,8 @@ impl App {
     pub fn new(cfg: Config, slots: Vec<SlotSpec>, ratio: Option<f32>, sim: Sim) -> Self {
         let anim = anim_params(&cfg);
         let layout: Vec<SlotLayout> = slots.iter().map(|s| SlotLayout { solid: s.solid, ring: s.ring }).collect();
-        let scene = Scene::new(&layout, &anim, &camera_params(&cfg)).with_ground(&cfg.ground_params());
+        let scene =
+            Scene::with_layout(&layout, &anim, &camera_params(&cfg), cfg.layout).with_ground(&cfg.ground_params());
         let specs: Vec<_> = slots.iter().map(|s| s.metric.clone()).collect();
         let metrics = MetricsState::new(&cfg, &specs);
         let weights = metrics.weights(&cfg.weights);
@@ -90,7 +122,10 @@ impl App {
             target,
             activity: 0.0,
             labels: Vec::new(),
+            cmap: cfg.color_map().ok().flatten(),
+            levels: Vec::new(),
             text: String::new(),
+            colors: Vec::new(),
             cfg,
             slots,
             ratio,
@@ -122,6 +157,11 @@ impl App {
         c.legend_opacity = new.legend_opacity;
         c.legend_pos = new.legend_pos;
         c.wireframe = new.wireframe;
+        c.color = new.color.clone();
+        c.color_by = new.color_by;
+        c.color_depth = new.color_depth;
+        c.color_reverse = new.color_reverse;
+        self.cmap = c.color_map().ok().flatten();
         c.min_scale = new.min_scale;
         c.max_scale = new.max_scale;
         c.idle_spin = new.idle_spin;
@@ -172,6 +212,8 @@ impl App {
         let want = activity_to_fps(a, self.cfg.fps_min, self.cfg.fps_max, self.cfg.fps_curve);
         self.target = slew_limit(self.target, want, self.cfg.fps_slew, dt).clamp(self.cfg.fps_min, self.cfg.fps_max);
         self.scene.update(&channels, &self.anim, dt);
+        self.levels.clear();
+        self.levels.extend(channels.iter().map(|c| if c.available { c.level } else { 0.0 }));
 
         let area_h = rows.saturating_sub(self.cfg.show_stats as usize);
         let vp = aspect::viewport(cols, area_h, self.ratio, self.cfg.aspect_mode, self.cfg.char_aspect);
@@ -202,29 +244,52 @@ impl App {
             char_aspect: self.cfg.char_aspect,
             ramp: &ramp,
             exposure: self.cfg.exposure,
+            color: self.cmap.as_ref(),
+            levels: &self.levels,
         };
         let mut pic = String::new();
+        let mut pic_colors: Vec<u32> = Vec::new();
         if let Some(view) = self.renderer.view() {
             let cells = self.overlays.compose(&view, vp.w, vp.h, &self.scene, &opt);
-            ascii::compose_plain(cells, vp.w, vp.h, &mut pic);
+            ascii::compose_plain(cells.chars, None, vp.w, vp.h, &mut pic);
+            if let (Some(c), Some(m)) = (cells.colors, self.cmap.as_ref()) {
+                pic_colors.extend(c.iter().map(|&c| display_color(c, m.depth)));
+            }
         }
 
         // Centre the picture in the cols × area_h area (letterbox margins).
+        // `colors` tracks `text` char for char when colour is on.
+        let colored = !pic_colors.is_empty();
         self.text.clear();
+        self.colors.clear();
+        let none = |colors: &mut Vec<u32>, n: usize| {
+            if colored {
+                colors.extend(std::iter::repeat_n(color::NONE, n));
+            }
+        };
         let pad_l = " ".repeat(vp.x);
         let blank = " ".repeat(cols);
         for _ in 0..vp.y {
             self.text.push_str(&blank);
             self.text.push('\n');
+            none(&mut self.colors, cols + 1);
         }
-        for line in pic.lines() {
+        for (y, line) in pic.lines().enumerate() {
             self.text.push_str(&pad_l);
             self.text.push_str(line);
             self.text.push('\n');
+            none(&mut self.colors, vp.x);
+            if colored {
+                let n = line.chars().count();
+                let row = pic_colors.get(y * vp.w..(y * vp.w + n).min(pic_colors.len())).unwrap_or(&[]);
+                self.colors.extend_from_slice(row);
+                none(&mut self.colors, n - row.len() + 1);
+            }
         }
         for _ in (vp.y + vp.h)..area_h {
             self.text.push_str(&blank);
             self.text.push('\n');
+            none(&mut self.colors, cols + 1);
         }
         if self.cfg.show_stats {
             let q = self.governor.level();
@@ -234,9 +299,16 @@ impl App {
                 self.sim.profile.id(),
                 100.0 * self.sim.envelope(self.sim.time())
             );
-            self.text.push_str(&ui::stats_line_fit(&readings, achieved, self.target, &extra, cols));
+            let line = ui::stats_line_fit(&readings, achieved, self.target, &extra, cols);
+            none(&mut self.colors, line.chars().count());
+            self.text.push_str(&line);
         }
         &self.text
+    }
+
+    /// Per-character colours of the last frame's text; empty when monochrome.
+    pub fn colors(&self) -> &[u32] {
+        &self.colors
     }
 
     pub fn sim_mut(&mut self) -> &mut Sim {
@@ -267,6 +339,7 @@ struct Host {
     app: Option<App>,
     input: Vec<u8>,
     output: Vec<u8>,
+    colors: Vec<u32>,
     message: Vec<u8>,
     sim: Sim,
 }
@@ -339,11 +412,13 @@ pub extern "C" fn set_sim(profile: u32, speed: f64, manual: f64, seed: u32) {
 #[unsafe(no_mangle)]
 pub extern "C" fn frame(dt: f32, cols: u32, rows: u32, achieved: f32, last_render: f32) -> usize {
     HOST.with_borrow_mut(|h| {
-        let Host { app, output, .. } = h;
+        let Host { app, output, colors, .. } = h;
         output.clear();
+        colors.clear();
         if let Some(app) = app.as_mut() {
             let s = app.frame(dt, cols.min(1000) as usize, rows.min(500) as usize, achieved, last_render);
             output.extend_from_slice(s.as_bytes());
+            colors.extend_from_slice(app.colors());
         }
         output.len()
     })
@@ -352,6 +427,18 @@ pub extern "C" fn frame(dt: f32, cols: u32, rows: u32, achieved: f32, last_rende
 #[unsafe(no_mangle)]
 pub extern "C" fn output_ptr() -> *const u8 {
     HOST.with_borrow(|h| h.output.as_ptr())
+}
+
+/// Per-character colours of the last frame (`0xRRGGBB`, `0xFFFFFFFF` = default).
+#[unsafe(no_mangle)]
+pub extern "C" fn colors_ptr() -> *const u32 {
+    HOST.with_borrow(|h| h.colors.as_ptr())
+}
+
+/// Number of entries at [`colors_ptr`]: the text's char count, or 0 when monochrome.
+#[unsafe(no_mangle)]
+pub extern "C" fn colors_len() -> usize {
+    HOST.with_borrow(|h| h.colors.len())
 }
 
 #[unsafe(no_mangle)]
@@ -435,5 +522,51 @@ mod tests {
     fn bad_config_reports_error() {
         assert!(load("show = [\"cpu-temp\"]").unwrap_err().contains("unknown metric"));
         assert!(load("nope = 1").is_err());
+        assert!(load("color = \"plaid\"").unwrap_err().contains("unknown gradient"));
+        assert!(load("layout = \"cube\"").is_err());
+    }
+
+    #[test]
+    fn colours_track_the_text_char_for_char() {
+        let mut a = app("show_stats = true\nlegend = true\naspect = \"square\"\n");
+        a.frame(0.1, 70, 20, 10.0, 0.01);
+        assert!(a.colors().is_empty(), "monochrome by default");
+        for toml in [
+            "color = \"inferno\"\nshow_stats = true\naspect = \"square\"\nlegend = true\n",
+            "color = \"traffic\"\ncolor_by = \"load\"\ncolor_depth = \"256\"\nshow_stats = true\n",
+        ] {
+            let (c, _, r) = load(toml).unwrap();
+            a.apply_live(&c, r);
+            for _ in 0..3 {
+                let t = a.frame(0.1, 70, 20, 10.0, 0.01).to_string();
+                assert_eq!(a.colors().len(), t.chars().count(), "{toml}");
+                assert!(a.colors().iter().any(|&c| c != color::NONE), "{toml}");
+                for (ch, &c) in t.chars().zip(a.colors()) {
+                    if ch == '\n' {
+                        assert_eq!(c, color::NONE);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sphere_layout_and_focus_camera_render() {
+        let mut a = app("layout = \"sphere\"\ncamera = \"focus\"\nfocus_zoom = 0.9\nshow = [\"cpu\", \"ram\", \"gpu\"]\n");
+        for _ in 0..30 {
+            let t = a.frame(1.0 / 30.0, 80, 24, 30.0, 0.01);
+            assert_eq!(t.lines().count(), 24);
+        }
+        assert_eq!(a.cfg.layout, platomon::scene::Layout::Sphere);
+    }
+
+    #[test]
+    fn palette_256_rgb() {
+        assert_eq!(xterm256_rgb(16), 0x000000);
+        assert_eq!(xterm256_rgb(231), 0xffffff);
+        assert_eq!(xterm256_rgb(196), 0xff0000);
+        assert_eq!(xterm256_rgb(244), 0x808080);
+        assert_eq!(display_color(0xff0101, ColorDepth::Ansi256), 0xff0000);
+        assert_eq!(display_color(0xff0101, ColorDepth::True), 0xff0101);
     }
 }
