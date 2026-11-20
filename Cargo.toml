@@ -8,6 +8,9 @@ license = "MIT OR Apache-2.0"
 [features]
 default = ["nvidia"]
 nvidia = ["dep:nvml-wrapper"]
+# The Windows screensaver lives in platomon-scr; declared so the shared
+# src/audio.rs (whose WASAPI capture is gated on it) compiles unchanged.
+screensaver = []
 
 [workspace]
 members = [".", "web"]

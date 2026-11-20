@@ -4,6 +4,7 @@
 //! renderer can be benchmarked and unit-tested.
 
 pub mod ascii;
+pub mod audio;
 pub mod aspect;
 pub mod clock;
 pub mod color;

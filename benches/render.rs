@@ -100,6 +100,8 @@ fn bench(c: &mut Criterion) {
         exposure: 1.0,
         color: None,
         levels: &[],
+        halo: None,
+        halo_factors: &[],
     };
     c.bench_function("wqhd_640x240_overlays_wireframe_legend", |b| {
         b.iter(|| {

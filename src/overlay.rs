@@ -364,6 +364,14 @@ pub struct Overlays {
     lum: Vec<f32>,
     cells: Vec<char>,
     colors: Vec<u32>,
+    /// Luminance under the halo (after the other overlays), for halo-only
+    /// updates.
+    base: Vec<f32>,
+    /// Cells the halo currently covers, as a mask and as a list.
+    halo_mask: Vec<bool>,
+    halo_cells: Vec<usize>,
+    scratch: Vec<usize>,
+    dirty: Vec<usize>,
 }
 
 /// What to draw this frame.
@@ -379,6 +387,137 @@ pub struct OverlayOptions<'a> {
     pub color: Option<&'a ColorMap>,
     /// Each slot's load 0..=1 (for `--color-by load`).
     pub levels: &'a [f32],
+    /// Sound halo: a second wireframe of every solid, drawn on top.
+    pub halo: Option<Halo>,
+    /// Per-slot halo sizes overriding `halo.factor` (empty = all solids use
+    /// `halo.factor`).
+    pub halo_factors: &'a [f32],
+}
+
+impl OverlayOptions<'_> {
+    /// Halo size per solid, or `None` without a halo.
+    fn halo_sizes(&self) -> Option<Vec<f32>> {
+        self.halo.map(|hl| {
+            let f = if self.halo_factors.is_empty() { &[hl.factor][..] } else { self.halo_factors };
+            f.iter().map(|v| if v.is_finite() { v.max(1.0) } else { 1.0 }).collect()
+        })
+    }
+}
+
+/// The sound halo for one frame.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Halo {
+    /// Size as a multiple of each solid's radius ([`halo_factor`]).
+    pub factor: f32,
+    /// Luminosity of its edges 0..=1 ([`halo_lum`]).
+    pub lum: f32,
+}
+
+/// Halo size swing, as a share of the solid's radius either way.
+pub const HALO_SWING: f32 = 0.05;
+/// Extra swing with the wide option.
+pub const HALO_SWING_WIDE_EXTRA: f32 = 0.25;
+
+/// Sound halo size: 1.2x the solid's radius, ±5% of the radius with the
+/// sound level (0 = silent, 1 = loudest recently); `wide` adds another ±25%
+/// (0.9x..1.5x).
+pub fn halo_factor(level: f32, wide: bool) -> f32 {
+    let l = if level.is_finite() { level.clamp(0.0, 1.0) } else { 0.0 };
+    let swing = HALO_SWING + if wide { HALO_SWING_WIDE_EXTRA } else { 0.0 };
+    1.20 + swing * (2.0 * l - 1.0)
+}
+
+/// Dimmest halo (silence, or no low frequencies).
+pub const HALO_LUM_MIN: f32 = 0.2;
+
+/// Sound halo luminosity from the bass-weighted spectrum level 0..=1: the
+/// more low-frequency energy, the brighter.
+pub fn halo_lum(level: f32) -> f32 {
+    let l = if level.is_finite() { level.clamp(0.0, 1.0) } else { 0.0 };
+    HALO_LUM_MIN + (1.0 - HALO_LUM_MIN) * l
+}
+
+/// Cells changed by [`Overlays::update_halo`], with the whole updated grid.
+pub struct HaloUpdate<'a> {
+    /// Changed cell indices, ascending.
+    pub dirty: &'a [usize],
+    pub chars: &'a [char],
+    pub colors: Option<&'a [u32]>,
+}
+
+/// Colour of one cell with luminance `l`, as [`Overlays::colorize`] gives it.
+fn cell_color(cm: &ColorMap, frame: &FrameView<'_>, ramp: &Ramp, levels: &[f32], i: usize, l: f32) -> u32 {
+    let (n, b) = (ramp.len(), ramp.level(l));
+    match cm.by {
+        ColorBy::Lum => cm.gradient.sample((b as f32 + 0.5) / n as f32, 1.0),
+        ColorBy::Load => {
+            let id = frame.ids.get(i).copied().unwrap_or(crate::render::NO_HIT) as usize;
+            levels.get(id).map_or(color::NONE, |&lv| cm.gradient.sample(lv, load_shade(b, n)))
+        }
+    }
+}
+
+/// Mark every visible edge cell of every solid's wire model scaled by
+/// `factors[i]` for solid `i` (1 = the solid itself; past the end of
+/// `factors`, its last value) in `mask`; newly marked cells are also pushed
+/// to `list`.
+#[allow(clippy::too_many_arguments)]
+fn mark_edges(
+    wires: &[Wire],
+    frame: &FrameView<'_>,
+    w: usize,
+    h: usize,
+    scene: &Scene,
+    factors: &[f32],
+    mask: &mut [bool],
+    mut list: Option<&mut Vec<usize>>,
+) {
+    if frame.depth.len() < w * h || frame.ids.len() < w * h || mask.len() < w * h {
+        return;
+    }
+    let proj = frame.proj;
+    let eye = proj.cam.pos;
+    for (i, (inst, wire)) in scene.solids.iter().zip(wires).enumerate() {
+        let rot = inst.inv_rot.transpose();
+        let factor = factors.get(i).or(factors.last()).copied().unwrap_or(1.0);
+        let scale = inst.scale * factor;
+        let front: Vec<bool> = wire
+            .faces
+            .iter()
+            .map(|&(n, o)| {
+                let nw = rot * n;
+                nw.dot(eye - (inst.center + nw * (o * scale))) > 0.0
+            })
+            .collect();
+        let world: Vec<Vec3A> = wire.verts.iter().map(|&v| inst.center + rot * (v * scale)).collect();
+        // Depth slack: an edge is hidden only by something clearly in front of it.
+        let tol = 0.2 * inst.scale + 0.02;
+        for &(a, b, f1, f2) in &wire.edges {
+            if !(front[f1] || front[f2]) {
+                continue; // back edge: the solid itself hides it
+            }
+            let (pa, pb) = (world[a], world[b]);
+            let (Some(sa), Some(sb)) = (proj.project(pa), proj.project(pb)) else { continue };
+            let n = (2.0 * (sb.0 - sa.0).abs().max((sb.1 - sa.1).abs())).ceil().max(1.0) as usize;
+            for s in 0..=n {
+                let p = pa.lerp(pb, s as f32 / n as f32);
+                let Some((x, y)) = proj.project(p) else { continue };
+                if x < 0.0 || y < 0.0 || x >= w as f32 || y >= h as f32 {
+                    continue;
+                }
+                let c = y as usize * w + x as usize;
+                if mask[c] {
+                    continue;
+                }
+                if frame.ids[c] as usize == i || frame.depth[c] >= (p - eye).length() - tol {
+                    mask[c] = true;
+                    if let Some(l) = list.as_deref_mut() {
+                        l.push(c);
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// The composed picture: glyphs and, when colour is on, per-cell colours.
@@ -396,7 +535,67 @@ fn load_shade(b: usize, n: usize) -> f32 {
 impl Overlays {
     pub fn new(scene: &Scene) -> Self {
         let wires = scene.solids.iter().map(|s| Wire::new(s.poly.kind())).collect();
-        Self { wires, mask: Vec::new(), lum: Vec::new(), cells: Vec::new(), colors: Vec::new() }
+        Self {
+            wires,
+            mask: Vec::new(),
+            lum: Vec::new(),
+            cells: Vec::new(),
+            colors: Vec::new(),
+            base: Vec::new(),
+            halo_mask: Vec::new(),
+            halo_cells: Vec::new(),
+            scratch: Vec::new(),
+            dirty: Vec::new(),
+        }
+    }
+
+    /// Redraw only the sound halo over the last composed frame (same `frame`,
+    /// size and scene as that [`Overlays::compose`]): the halo moves to
+    /// `opt.halo` and only cells whose glyph or colour changed are reported.
+    /// `opt.halo = None` removes it. Legend panels are not re-applied (call
+    /// `compose` for those).
+    pub fn update_halo(
+        &mut self,
+        frame: &FrameView<'_>,
+        w: usize,
+        h: usize,
+        scene: &Scene,
+        opt: &OverlayOptions<'_>,
+    ) -> HaloUpdate<'_> {
+        self.dirty.clear();
+        let color_on = opt.color.is_some();
+        if self.base.len() == w * h && self.cells.len() == w * h && self.halo_mask.len() == w * h {
+            for &c in &self.halo_cells {
+                self.halo_mask[c] = false;
+            }
+            let mut fresh = std::mem::take(&mut self.scratch);
+            fresh.clear();
+            if let Some(sizes) = opt.halo_sizes() {
+                mark_edges(&self.wires, frame, w, h, scene, &sizes, &mut self.halo_mask, Some(&mut fresh));
+            }
+            let lum_on = opt.halo.map_or(0.0, |hl| hl.lum);
+            for &c in self.halo_cells.iter().chain(&fresh) {
+                let l = if self.halo_mask[c] { lum_on } else { self.base[c] };
+                let g = opt.ramp.glyph(l);
+                let col = opt.color.map(|cm| cell_color(cm, frame, opt.ramp, opt.levels, c, l));
+                let changed = self.cells[c] != g || col.is_some_and(|k| self.colors.get(c) != Some(&k));
+                if changed {
+                    self.cells[c] = g;
+                    if let (Some(k), Some(slot)) = (col, self.colors.get_mut(c)) {
+                        *slot = k;
+                    }
+                    self.dirty.push(c);
+                }
+            }
+            self.dirty.sort_unstable();
+            self.dirty.dedup();
+            self.scratch = std::mem::replace(&mut self.halo_cells, fresh);
+        }
+        HaloUpdate {
+            dirty: &self.dirty,
+            chars: &self.cells,
+            colors: color_on.then_some(&self.colors[..]),
+        }
     }
 
     /// Fill `self.colors` from the final luminances.
@@ -435,7 +634,14 @@ impl Overlays {
         ascii::tone_buffer(frame.radiance, opt.exposure, &mut self.lum);
         self.lum.resize(w * h, 0.0);
         if opt.wireframe {
-            self.invert_edges(frame, w, h, scene);
+            self.mask.clear();
+            self.mask.resize(w * h, false);
+            mark_edges(&self.wires, frame, w, h, scene, &[1.0], &mut self.mask, None);
+            for (l, &m) in self.lum.iter_mut().zip(&self.mask) {
+                if m {
+                    *l = invert(*l);
+                }
+            }
         }
         let panel = opt.legend.and_then(|p| layout(p, w, h, opt.labels, opt.char_aspect).map(|panel| (p, panel)));
         if let Some((p, panel)) = &panel {
@@ -445,6 +651,20 @@ impl Overlays {
                     *l *= keep;
                 }
             }
+        }
+        // Sound halo on top, at its own luminosity; what lies under it is kept
+        // for halo-only updates.
+        self.halo_mask.clear();
+        self.halo_mask.resize(w * h, false);
+        self.halo_cells.clear();
+        if let (Some(hl), Some(sizes)) = (opt.halo, opt.halo_sizes()) {
+            self.base.clone_from(&self.lum);
+            mark_edges(&self.wires, frame, w, h, scene, &sizes, &mut self.halo_mask, Some(&mut self.halo_cells));
+            for &c in &self.halo_cells {
+                self.lum[c] = hl.lum;
+            }
+        } else {
+            self.base.clear();
         }
         ascii::shade(&self.lum, ramp, &mut self.cells);
         if let Some(cm) = opt.color {
@@ -471,58 +691,6 @@ impl Overlays {
             draw_legend(&mut g, panel, &self.wires, scene, opt, &icon_ink);
         }
         Cells { chars: &self.cells, colors: opt.color.is_some().then_some(&self.colors[..]) }
-    }
-
-    /// Mark every visible edge cell of every solid and invert its luminosity.
-    fn invert_edges(&mut self, frame: &FrameView<'_>, w: usize, h: usize, scene: &Scene) {
-        self.mask.clear();
-        self.mask.resize(w * h, false);
-        if frame.depth.len() < w * h || frame.ids.len() < w * h {
-            return;
-        }
-        let proj = frame.proj;
-        let eye = proj.cam.pos;
-        for (i, (inst, wire)) in scene.solids.iter().zip(&self.wires).enumerate() {
-            let rot = inst.inv_rot.transpose();
-            let front: Vec<bool> = wire
-                .faces
-                .iter()
-                .map(|&(n, o)| {
-                    let nw = rot * n;
-                    nw.dot(eye - (inst.center + nw * (o * inst.scale))) > 0.0
-                })
-                .collect();
-            let world: Vec<Vec3A> = wire.verts.iter().map(|&v| inst.center + rot * (v * inst.scale)).collect();
-            // Depth slack: an edge is hidden only by something clearly in front of it.
-            let tol = 0.2 * inst.scale + 0.02;
-            for &(a, b, f1, f2) in &wire.edges {
-                if !(front[f1] || front[f2]) {
-                    continue; // back edge: the solid itself hides it
-                }
-                let (pa, pb) = (world[a], world[b]);
-                let (Some(sa), Some(sb)) = (proj.project(pa), proj.project(pb)) else { continue };
-                let n = (2.0 * (sb.0 - sa.0).abs().max((sb.1 - sa.1).abs())).ceil().max(1.0) as usize;
-                for s in 0..=n {
-                    let p = pa.lerp(pb, s as f32 / n as f32);
-                    let Some((x, y)) = proj.project(p) else { continue };
-                    if x < 0.0 || y < 0.0 || x >= w as f32 || y >= h as f32 {
-                        continue;
-                    }
-                    let c = y as usize * w + x as usize;
-                    if self.mask[c] {
-                        continue;
-                    }
-                    if frame.ids[c] as usize == i || frame.depth[c] >= (p - eye).length() - tol {
-                        self.mask[c] = true;
-                    }
-                }
-            }
-        }
-        for (l, &m) in self.lum.iter_mut().zip(&self.mask) {
-            if m {
-                *l = invert(*l);
-            }
-        }
     }
 }
 
@@ -661,6 +829,15 @@ mod tests {
         legend: Option<&LegendParams>,
         color: Option<&ColorMap>,
     ) -> (Vec<char>, Vec<char>, Option<Vec<u32>>, Vec<u8>) {
+        frame_halo(wireframe, legend, color, None)
+    }
+
+    fn frame_halo(
+        wireframe: bool,
+        legend: Option<&LegendParams>,
+        color: Option<&ColorMap>,
+        halo: Option<Halo>,
+    ) -> (Vec<char>, Vec<char>, Option<Vec<u32>>, Vec<u8>) {
         let scene = Scene::demo(&AnimParams::default());
         let mut r = Renderer::new();
         let rs = RenderSettings { spp: 1, ..RenderSettings::default() };
@@ -680,6 +857,8 @@ mod tests {
             exposure: 1.0,
             color,
             levels: &levels,
+            halo,
+            halo_factors: &[],
         };
         let out = o.compose(&view, W, H, &scene, &opt);
         (plain, out.chars.to_vec(), out.colors.map(<[u32]>::to_vec), view.ids.to_vec())
@@ -752,6 +931,204 @@ mod tests {
         let changed = plain.iter().zip(&out).filter(|(a, b)| a != b).count();
         assert!(changed > 50, "edges drawn: {changed}");
         assert!(changed < plain.len() / 3, "not the whole picture: {changed}");
+    }
+
+    #[test]
+    fn halo_factor_spans_plus_minus_five_percent_around_1_2() {
+        assert!((halo_factor(0.0, false) - 1.15).abs() < 1e-6);
+        assert!((halo_factor(0.5, false) - 1.20).abs() < 1e-6);
+        assert!((halo_factor(1.0, false) - 1.25).abs() < 1e-6);
+        assert_eq!(halo_factor(7.0, false), halo_factor(1.0, false));
+        assert_eq!(halo_factor(f32::NAN, false), halo_factor(0.0, false));
+        // wide: an extra ±25% of the radius, ±30% in all
+        assert!((halo_factor(0.0, true) - 0.90).abs() < 1e-6);
+        assert!((halo_factor(0.5, true) - 1.20).abs() < 1e-6);
+        assert!((halo_factor(1.0, true) - 1.50).abs() < 1e-6);
+        assert_eq!(halo_factor(f32::NAN, true), halo_factor(0.0, true));
+    }
+
+    #[test]
+    fn halo_lum_rises_with_bass_level() {
+        assert_eq!(halo_lum(0.0), HALO_LUM_MIN);
+        assert_eq!(halo_lum(1.0), 1.0);
+        assert!(halo_lum(0.3) < halo_lum(0.6));
+        assert_eq!(halo_lum(f32::NAN), HALO_LUM_MIN);
+    }
+
+    fn bright(factor: f32) -> Option<Halo> {
+        Some(Halo { factor, lum: 1.0 })
+    }
+
+    #[test]
+    fn sound_halo_draws_its_luminosity() {
+        for lum in [0.0, 0.5, 1.0] {
+            let (_, out, _, _) = frame_halo(false, None, None, Some(Halo { factor: 1.2, lum }));
+            let (_, plain, _, _) = frame_halo(false, None, None, None);
+            let g = Ramp::default().glyph(lum);
+            let changed: Vec<char> = plain.iter().zip(&out).filter(|(a, b)| a != b).map(|(_, b)| *b).collect();
+            assert!(!changed.is_empty(), "lum {lum}");
+            assert!(changed.iter().all(|&c| c == g), "lum {lum}: halo cells are all {g:?}");
+        }
+    }
+
+    #[test]
+    fn halo_only_updates_match_a_full_compose() {
+        let scene = Scene::demo(&AnimParams::default());
+        let mut r = Renderer::new();
+        r.render(&scene, W, H, &RenderSettings { spp: 1, ..RenderSettings::default() });
+        let view = r.view().unwrap();
+        let ramp = Ramp::default();
+        let levels = [0.0, 0.25, 0.5, 0.75, 1.0];
+        let lum_cm = ColorMap {
+            gradient: crate::color::Gradient::parse("inferno").unwrap(),
+            by: ColorBy::Lum,
+            depth: crate::color::ColorDepth::True,
+        };
+        let load_cm = ColorMap { by: ColorBy::Load, ..lum_cm.clone() };
+        for (wireframe, cm) in [(false, None), (true, Some(&lum_cm)), (true, Some(&load_cm))] {
+            let opt = |halo| OverlayOptions {
+                wireframe,
+                legend: None,
+                labels: &[],
+                char_aspect: 0.5,
+                ramp: &ramp,
+                exposure: 1.0,
+                color: cm,
+                levels: &levels,
+                halo,
+                halo_factors: &[],
+            };
+            let steps = [
+                Some(Halo { factor: 1.15, lum: 0.2 }),
+                Some(Halo { factor: 1.25, lum: 0.9 }),
+                Some(Halo { factor: 1.25, lum: 0.9 }),
+                Some(Halo { factor: 1.18, lum: 0.5 }),
+                None,
+                Some(Halo { factor: 1.2, lum: 1.0 }),
+            ];
+            let mut inc = Overlays::new(&scene);
+            let first = inc.compose(&view, W, H, &scene, &opt(steps[0]));
+            let (mut chars, mut colors) = (first.chars.to_vec(), first.colors.map(<[u32]>::to_vec));
+            for (k, &h) in steps.iter().enumerate().skip(1) {
+                let u = inc.update_halo(&view, W, H, &scene, &opt(h));
+                // apply only the reported cells to the previous picture
+                for &c in u.dirty {
+                    chars[c] = u.chars[c];
+                    if let (Some(cs), Some(uc)) = (colors.as_mut(), u.colors) {
+                        cs[c] = uc[c];
+                    }
+                }
+                assert!(u.dirty.windows(2).all(|p| p[0] < p[1]), "ascending, no repeats");
+                if k == 2 {
+                    assert!(u.dirty.is_empty(), "same halo again: nothing to redraw");
+                }
+                let mut full = Overlays::new(&scene);
+                let f = full.compose(&view, W, H, &scene, &opt(h));
+                assert_eq!(chars, f.chars, "step {k} ({wireframe}, {:?}) glyphs", cm.map(|c| c.by));
+                assert_eq!(colors.as_deref(), f.colors, "step {k} colours");
+            }
+        }
+    }
+
+    #[test]
+    fn per_solid_halo_sizes_move_only_their_solid() {
+        let scene = Scene::demo(&AnimParams::default());
+        let mut r = Renderer::new();
+        r.render(&scene, W, H, &RenderSettings { spp: 1, ..RenderSettings::default() });
+        let view = r.view().unwrap();
+        let ramp = Ramp::default();
+        let centres: Vec<(f32, f32)> = scene.solids.iter().filter_map(|s| view.proj.project(s.center)).collect();
+        let opt = |f: &'static [f32]| OverlayOptions {
+            wireframe: false,
+            legend: None,
+            labels: &[],
+            char_aspect: 0.5,
+            ramp: &ramp,
+            exposure: 1.0,
+            color: None,
+            levels: &[],
+            halo: Some(Halo { factor: 1.2, lum: 1.0 }),
+            halo_factors: f,
+        };
+        let calm: &'static [f32] = &[1.15; 5];
+        let base = Overlays::new(&scene).compose(&view, W, H, &scene, &opt(calm)).chars.to_vec();
+        // the factors override `halo.factor`
+        let single = Overlays::new(&scene).compose(&view, W, H, &scene, &opt(&[])).chars.to_vec();
+        assert_ne!(base, single);
+        let bumps: [&'static [f32]; 5] = [
+            &[1.4, 1.15, 1.15, 1.15, 1.15],
+            &[1.15, 1.4, 1.15, 1.15, 1.15],
+            &[1.15, 1.15, 1.4, 1.15, 1.15],
+            &[1.15, 1.15, 1.15, 1.4, 1.15],
+            &[1.15, 1.15, 1.15, 1.15, 1.4],
+        ];
+        let mut inc = Overlays::new(&scene);
+        inc.compose(&view, W, H, &scene, &opt(calm));
+        for (k, f) in bumps.into_iter().enumerate() {
+            let out = Overlays::new(&scene).compose(&view, W, H, &scene, &opt(f)).chars.to_vec();
+            let diff: Vec<usize> = (0..W * H).filter(|&i| out[i] != base[i]).collect();
+            assert!(!diff.is_empty(), "solid {k}'s halo moved");
+            let nearest = |i: usize| {
+                let (x, y) = ((i % W) as f32 + 0.5, (i / W) as f32 + 0.5);
+                (0..centres.len())
+                    .min_by(|&a, &b| {
+                        let d = |c: (f32, f32)| ((x - c.0) * 0.5).hypot(y - c.1);
+                        d(centres[a]).total_cmp(&d(centres[b]))
+                    })
+                    .unwrap()
+            };
+            let near_k = diff.iter().filter(|&&i| nearest(i) == k).count();
+            assert!(near_k * 10 >= diff.len() * 8, "solid {k}: {near_k}/{} changed cells near it", diff.len());
+            // halo-only updates agree with a full compose
+            let u = inc.update_halo(&view, W, H, &scene, &opt(f));
+            assert_eq!(u.chars, &out[..], "solid {k}: incremental matches full");
+        }
+    }
+
+    #[test]
+    fn sound_halo_draws_outside_the_solids_and_grows_with_level() {
+        let (plain, _, _, ids) = frame_halo(false, None, None, None);
+        let changed = |f: f32| {
+            let (_, out, _, _) = frame_halo(false, None, None, bright(f));
+            plain.iter().zip(&out).enumerate().filter(|(_, (a, b))| a != b).map(|(i, _)| i).collect::<Vec<_>>()
+        };
+        let quiet = changed(halo_factor(0.0, false));
+        let loud = changed(halo_factor(1.0, false));
+        assert!(quiet.len() > 50, "halo drawn: {}", quiet.len());
+        assert!(quiet.len() < plain.len() / 3);
+        // ids 0..5 are the demo's solids; anything else is background
+        let outside = quiet.iter().filter(|&&i| ids[i] >= 5).count();
+        assert!(outside * 2 > quiet.len(), "mostly around the solids, not on them: {outside}/{}", quiet.len());
+        assert_ne!(quiet, loud, "the halo moves with the level");
+        // the loud halo sits further from the solids' centres on average
+        let scene = Scene::demo(&AnimParams::default());
+        let mut r = Renderer::new();
+        r.render(&scene, W, H, &RenderSettings { spp: 1, ..RenderSettings::default() });
+        let proj = r.view().unwrap().proj;
+        let centres: Vec<(f32, f32)> = scene.solids.iter().filter_map(|s| proj.project(s.center)).collect();
+        assert_eq!(centres.len(), 5);
+        let spread = |cells: &[usize]| {
+            cells
+                .iter()
+                .map(|&i| {
+                    let (x, y) = ((i % W) as f32 + 0.5, (i / W) as f32 + 0.5);
+                    centres.iter().map(|c| ((x - c.0) * 0.5).hypot(y - c.1)).fold(f32::MAX, f32::min)
+                })
+                .sum::<f32>()
+                / cells.len() as f32
+        };
+        assert!(spread(&loud) > spread(&quiet), "{} vs {}", spread(&loud), spread(&quiet));
+        // the wide swing goes further out when loud and inside the solid when quiet
+        let wide_loud = changed(halo_factor(1.0, true));
+        let wide_quiet = changed(halo_factor(0.0, true));
+        assert!(spread(&wide_loud) > spread(&loud), "{} vs {}", spread(&wide_loud), spread(&loud));
+        assert!(spread(&wide_quiet) < spread(&quiet), "{} vs {}", spread(&wide_quiet), spread(&quiet));
+        let on_solids = wide_quiet.iter().filter(|&&i| ids[i] < 5).count();
+        assert!(on_solids * 2 > wide_quiet.len(), "0.9x lies over the solids: {on_solids}/{}", wide_quiet.len());
+        // wireframe and halo together mark both
+        let (_, both, _, _) = frame_halo(true, None, None, bright(1.2));
+        let (_, wire, _, _) = frame_halo(true, None, None, None);
+        assert!(both.iter().zip(&wire).filter(|(a, b)| a != b).count() > 50);
     }
 
     #[test]

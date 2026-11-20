@@ -7,22 +7,30 @@
 //! collector, so smoothing, peaks, activity and fps behave as on a machine.
 //! With a colour gradient on, [`colors_ptr`] / [`colors_len`] give one
 //! `0xRRGGBB` (or [`color::NONE`]) per character of the output text.
+//!
+//! Sound halo ([`sound`]): as in the `platomon-scr` screensaver, a second
+//! wireframe of each solid follows the sound level and spectrum. Between full
+//! frames the page calls [`halo_frame`] at the display rate, which redraws
+//! only the halo over the last rendered picture.
+
+pub mod sound;
 
 use std::cell::RefCell;
 
 use glam::Vec2;
-use platomon::ascii::{self, Ramp};
-use platomon::aspect::{self, AspectMode};
+use platomon::ascii::Ramp;
+use platomon::aspect::{self, AspectMode, Viewport};
 use platomon::clock::{activity_to_fps, slew_limit};
 use platomon::color::{self, ColorDepth, ColorMap};
 use platomon::config::{Config, SlotSpec};
 use platomon::metrics::{MetricsState, activity_score};
-use platomon::overlay::{OverlayOptions, Overlays};
+use platomon::overlay::{Halo, OverlayOptions, Overlays};
 use platomon::render::{QualityGovernor, RenderSettings, Renderer, TraceSettings};
 use platomon::scene::camera::CameraParams;
 use platomon::scene::{AnimParams, Ground, Scene, SlotLayout};
 use platomon::sim::{Profile, Sim};
 use platomon::ui;
+use sound::{SoundHalo, Source};
 
 /// Everything that lives between frames.
 pub struct App {
@@ -46,6 +54,72 @@ pub struct App {
     text: String,
     /// One colour per char of `text` (newlines included); empty when monochrome.
     colors: Vec<u32>,
+    /// The picture's glyphs (`vp.w × vp.h`) and display colours.
+    pic_chars: Vec<char>,
+    pic_colors: Vec<u32>,
+    sound: SoundHalo,
+    /// Layout of the last full frame, for halo-only frames.
+    last: Option<LastFrame>,
+    /// Sound time already advanced by halo-only frames since the last full
+    /// frame (so a full frame's `dt` is not counted twice).
+    halo_time: f32,
+}
+
+/// What a halo-only frame reuses from the last full frame.
+struct LastFrame {
+    vp: Viewport,
+    cols: usize,
+    area_h: usize,
+    stats: Option<String>,
+}
+
+/// Lay the picture out in the `cols × area_h` area (letterbox margins) plus
+/// the stats line. `colors` tracks `text` char for char when `pic_colors` is
+/// non-empty, and is left empty otherwise.
+fn assemble(
+    text: &mut String,
+    colors: &mut Vec<u32>,
+    (chars, pic_colors): (&[char], &[u32]),
+    vp: &Viewport,
+    (cols, area_h): (usize, usize),
+    stats: Option<&str>,
+) {
+    let colored = !pic_colors.is_empty();
+    text.clear();
+    colors.clear();
+    let none = |colors: &mut Vec<u32>, n: usize| {
+        if colored {
+            colors.extend(std::iter::repeat_n(color::NONE, n));
+        }
+    };
+    let blank = |text: &mut String, n: usize| text.extend(std::iter::repeat_n(' ', n));
+    for _ in 0..vp.y {
+        blank(text, cols);
+        text.push('\n');
+        none(colors, cols + 1);
+    }
+    for y in 0..vp.h {
+        blank(text, vp.x);
+        none(colors, vp.x);
+        let (lo, hi) = ((y * vp.w).min(chars.len()), ((y + 1) * vp.w).min(chars.len()));
+        text.extend(&chars[lo..hi]);
+        blank(text, vp.w - (hi - lo));
+        text.push('\n');
+        if colored {
+            let row = pic_colors.get(lo..hi.min(pic_colors.len())).unwrap_or(&[]);
+            colors.extend_from_slice(row);
+            none(colors, vp.w - row.len() + 1);
+        }
+    }
+    for _ in (vp.y + vp.h)..area_h {
+        blank(text, cols);
+        text.push('\n');
+        none(colors, cols + 1);
+    }
+    if let Some(line) = stats {
+        none(colors, line.chars().count());
+        text.push_str(line);
+    }
 }
 
 fn anim_params(c: &Config) -> AnimParams {
@@ -126,6 +200,11 @@ impl App {
             levels: Vec::new(),
             text: String::new(),
             colors: Vec::new(),
+            pic_chars: Vec::new(),
+            pic_colors: Vec::new(),
+            sound: SoundHalo::default(),
+            last: None,
+            halo_time: 0.0,
             cfg,
             slots,
             ratio,
@@ -185,6 +264,21 @@ impl App {
             c.bg_rotate_period = new.bg_rotate_period;
         }
         self.target = self.target.clamp(c.fps_min, c.fps_max);
+        // Halo-only frames wait for a full frame with the new settings.
+        self.last = None;
+    }
+
+    /// Sound halo settings (see [`set_sound`]).
+    pub fn set_sound(&mut self, source: Source, wide: bool, bands: bool) {
+        self.sound.configure(source, wide, bands, &self.scene);
+    }
+
+    pub fn sound(&self) -> &SoundHalo {
+        &self.sound
+    }
+
+    pub fn sound_mut(&mut self) -> &mut SoundHalo {
+        &mut self.sound
     }
 
     pub fn target_fps(&self) -> f32 {
@@ -235,6 +329,7 @@ impl App {
             let block = self.cfg.legend_size >= 3;
             self.labels.extend(readings.iter().map(|r| if block { ui::short_label(r) } else { ui::segment(r) }));
         }
+        let halo = self.sound.next((dt - std::mem::take(&mut self.halo_time)).max(0.0));
         let ramp = Ramp::new(&self.cfg.ramp);
         let legend = self.cfg.legend_params();
         let opt = OverlayOptions {
@@ -246,52 +341,20 @@ impl App {
             exposure: self.cfg.exposure,
             color: self.cmap.as_ref(),
             levels: &self.levels,
+            halo,
+            halo_factors: self.sound.factors(),
         };
-        let mut pic = String::new();
-        let mut pic_colors: Vec<u32> = Vec::new();
+        self.pic_chars.clear();
+        self.pic_colors.clear();
         if let Some(view) = self.renderer.view() {
             let cells = self.overlays.compose(&view, vp.w, vp.h, &self.scene, &opt);
-            ascii::compose_plain(cells.chars, None, vp.w, vp.h, &mut pic);
+            self.pic_chars.extend_from_slice(cells.chars);
             if let (Some(c), Some(m)) = (cells.colors, self.cmap.as_ref()) {
-                pic_colors.extend(c.iter().map(|&c| display_color(c, m.depth)));
+                self.pic_colors.extend(c.iter().map(|&c| display_color(c, m.depth)));
             }
         }
 
-        // Centre the picture in the cols × area_h area (letterbox margins).
-        // `colors` tracks `text` char for char when colour is on.
-        let colored = !pic_colors.is_empty();
-        self.text.clear();
-        self.colors.clear();
-        let none = |colors: &mut Vec<u32>, n: usize| {
-            if colored {
-                colors.extend(std::iter::repeat_n(color::NONE, n));
-            }
-        };
-        let pad_l = " ".repeat(vp.x);
-        let blank = " ".repeat(cols);
-        for _ in 0..vp.y {
-            self.text.push_str(&blank);
-            self.text.push('\n');
-            none(&mut self.colors, cols + 1);
-        }
-        for (y, line) in pic.lines().enumerate() {
-            self.text.push_str(&pad_l);
-            self.text.push_str(line);
-            self.text.push('\n');
-            none(&mut self.colors, vp.x);
-            if colored {
-                let n = line.chars().count();
-                let row = pic_colors.get(y * vp.w..(y * vp.w + n).min(pic_colors.len())).unwrap_or(&[]);
-                self.colors.extend_from_slice(row);
-                none(&mut self.colors, n - row.len() + 1);
-            }
-        }
-        for _ in (vp.y + vp.h)..area_h {
-            self.text.push_str(&blank);
-            self.text.push('\n');
-            none(&mut self.colors, cols + 1);
-        }
-        if self.cfg.show_stats {
+        let stats = self.cfg.show_stats.then(|| {
             let q = self.governor.level();
             let extra = format!(
                 "{} | sim {} {:.0}%",
@@ -299,11 +362,66 @@ impl App {
                 self.sim.profile.id(),
                 100.0 * self.sim.envelope(self.sim.time())
             );
-            let line = ui::stats_line_fit(&readings, achieved, self.target, &extra, cols);
-            none(&mut self.colors, line.chars().count());
-            self.text.push_str(&line);
-        }
+            ui::stats_line_fit(&readings, achieved, self.target, &extra, cols)
+        });
+        assemble(
+            &mut self.text,
+            &mut self.colors,
+            (&self.pic_chars, &self.pic_colors),
+            &vp,
+            (cols, area_h),
+            stats.as_deref(),
+        );
+        self.last = self.renderer.view().is_some().then_some(LastFrame { vp, cols, area_h, stats });
         &self.text
+    }
+
+    /// Between full frames: advance the sound by `dt` and redraw only the
+    /// halo over the last full frame. `None` when there is nothing to redraw
+    /// (halo off, no full frame yet, or no cell changed).
+    pub fn halo_frame(&mut self, dt: f32) -> Option<&str> {
+        if self.sound.source == Source::Off {
+            return None;
+        }
+        let last = self.last.as_ref()?;
+        let dt = if dt.is_finite() { dt.clamp(0.0, 0.25) } else { 0.0 };
+        self.halo_time += dt;
+        let halo: Option<Halo> = self.sound.next(dt);
+        let ramp = Ramp::new(&self.cfg.ramp);
+        let legend = self.cfg.legend_params();
+        let opt = OverlayOptions {
+            wireframe: self.cfg.wireframe,
+            legend: self.cfg.legend.then_some(&legend),
+            labels: &self.labels,
+            char_aspect: self.cfg.char_aspect,
+            ramp: &ramp,
+            exposure: self.cfg.exposure,
+            color: self.cmap.as_ref(),
+            levels: &self.levels,
+            halo,
+            halo_factors: self.sound.factors(),
+        };
+        let view = self.renderer.view()?;
+        let vp = last.vp;
+        let u = self.overlays.update_halo(&view, vp.w, vp.h, &self.scene, &opt);
+        if u.dirty.is_empty() {
+            return None;
+        }
+        self.pic_chars.clear();
+        self.pic_chars.extend_from_slice(u.chars);
+        self.pic_colors.clear();
+        if let (Some(c), Some(m)) = (u.colors, self.cmap.as_ref()) {
+            self.pic_colors.extend(c.iter().map(|&c| display_color(c, m.depth)));
+        }
+        assemble(
+            &mut self.text,
+            &mut self.colors,
+            (&self.pic_chars, &self.pic_colors),
+            &vp,
+            (last.cols, last.area_h),
+            last.stats.as_deref(),
+        );
+        Some(&self.text)
     }
 
     /// Per-character colours of the last frame's text; empty when monochrome.
@@ -342,6 +460,10 @@ struct Host {
     colors: Vec<u32>,
     message: Vec<u8>,
     sim: Sim,
+    /// Sound settings, kept across restarts: source, wide swing, bands.
+    sound: (Source, bool, bool),
+    /// Samples written by the page (see [`audio_buffer`]).
+    audio: Vec<f32>,
 }
 
 thread_local! {
@@ -372,7 +494,10 @@ pub extern "C" fn configure(len: usize, restart: u32) -> u32 {
                     Some(app) if restart == 0 => app.apply_live(&cfg, ratio),
                     _ => {
                         let sim = h.sim.clone();
-                        h.app = Some(App::new(cfg, slots, ratio, sim));
+                        let mut app = App::new(cfg, slots, ratio, sim);
+                        let (src, wide, bands) = h.sound;
+                        app.set_sound(src, wide, bands);
+                        h.app = Some(app);
                     }
                 }
                 h.message.clear();
@@ -405,6 +530,75 @@ pub extern "C" fn set_sim(profile: u32, speed: f64, manual: f64, seed: u32) {
             *app.sim_mut() = next.clone();
         }
         h.sim = next;
+    })
+}
+
+/// Sound halo: `source` 0 = off, 1 = simulated music, 2 = samples from the
+/// page ([`audio_push`]); `wide` 1 = size swing ±30% instead of ±5%;
+/// `bands` 1 = each solid follows its own frequency band, 0 = overall level.
+#[unsafe(no_mangle)]
+pub extern "C" fn set_sound(source: u32, wide: u32, bands: u32) {
+    HOST.with_borrow_mut(|h| {
+        h.sound = (Source::from_index(source), wide != 0, bands != 0);
+        if let Some(app) = h.app.as_mut() {
+            app.set_sound(h.sound.0, h.sound.1, h.sound.2);
+        }
+    })
+}
+
+/// Reserve room for `len` f32 samples for [`audio_push`]; returns the address.
+#[unsafe(no_mangle)]
+pub extern "C" fn audio_buffer(len: usize) -> *mut f32 {
+    HOST.with_borrow_mut(|h| {
+        h.audio.clear();
+        h.audio.resize(len.min(1 << 16), 0.0);
+        h.audio.as_mut_ptr()
+    })
+}
+
+/// Hand the page's latest `len` mono samples at `rate` Hz to the halo
+/// (source 2 only). Call before each frame / halo frame.
+#[unsafe(no_mangle)]
+pub extern "C" fn audio_push(len: usize, rate: f32) {
+    HOST.with_borrow_mut(|h| {
+        let Host { app, audio, .. } = h;
+        if let Some(app) = app.as_mut() {
+            let n = len.min(audio.len());
+            app.sound_mut().set_window(&audio[..n], rate);
+        }
+    })
+}
+
+/// Halo-only frame between full frames; returns the text length in the
+/// output buffer, or 0 when the screen does not need repainting.
+#[unsafe(no_mangle)]
+pub extern "C" fn halo_frame(dt: f32) -> usize {
+    HOST.with_borrow_mut(|h| {
+        let Host { app, output, colors, .. } = h;
+        let Some(app) = app.as_mut() else { return 0 };
+        let Some(s) = app.halo_frame(dt) else { return 0 };
+        output.clear();
+        output.extend_from_slice(s.as_bytes());
+        colors.clear();
+        colors.extend_from_slice(app.colors());
+        output.len()
+    })
+}
+
+/// Sound meter: 0 = raw peak, 1 = bass-weighted spectrum level, 2 = halo
+/// size (x radius), 3 = halo luminosity; 0 when off.
+#[unsafe(no_mangle)]
+pub extern "C" fn sound_info(what: u32) -> f32 {
+    HOST.with_borrow(|h| {
+        let Some(s) = h.app.as_ref().map(App::sound) else { return 0.0 };
+        let halo = s.last();
+        match what {
+            0 => s.meter.0,
+            1 => s.meter.1,
+            2 => halo.map_or(0.0, |x| x.factor),
+            3 => halo.map_or(0.0, |x| x.lum),
+            _ => 0.0,
+        }
     })
 }
 
@@ -558,6 +752,55 @@ mod tests {
             assert_eq!(t.lines().count(), 24);
         }
         assert_eq!(a.cfg.layout, platomon::scene::Layout::Sphere);
+    }
+
+    #[test]
+    fn sound_halo_draws_and_halo_frames_redraw_it() {
+        let mut a = app("show_stats = true\nlegend = true\n");
+        a.set_sound(Source::Off, false, true);
+        let quiet = a.frame(0.1, 100, 30, 10.0, 0.01).to_string();
+        assert!(a.halo_frame(0.016).is_none(), "halo off: nothing to redraw");
+        a.set_sound(Source::Sim, true, true);
+        let mut changed = 0;
+        let mut sizes = Vec::new();
+        for i in 0..40 {
+            let t = if i % 8 == 0 {
+                a.frame(0.1, 100, 30, 10.0, 0.01).to_string()
+            } else {
+                match a.halo_frame(1.0 / 60.0) {
+                    Some(t) => {
+                        changed += 1;
+                        t.to_string()
+                    }
+                    None => continue,
+                }
+            };
+            assert_eq!(t.split('\n').count(), 30, "same layout");
+            let bad: Vec<_> = t.lines().enumerate().filter(|(_, l)| l.chars().count() != 100).map(|(i, l)| (i, l.chars().count())).collect();
+            assert!(bad.iter().all(|&(i, _)| i == 29), "{bad:?}");
+            sizes.push(a.sound().last().unwrap().factor);
+        }
+        assert!(changed > 0, "halo-only frames repaint");
+        assert_ne!(a.frame(0.1, 100, 30, 10.0, 0.01), quiet, "halo visible");
+        let (lo, hi) = sizes.iter().fold((f32::MAX, f32::MIN), |(l, h), &v| (l.min(v), h.max(v)));
+        assert!(lo >= 0.9 && hi <= 1.5 && hi > lo, "wide swing range {lo}..{hi}");
+        assert_eq!(a.sound().factors().len(), 5, "one size per solid by frequency");
+    }
+
+    #[test]
+    fn host_samples_drive_the_halo() {
+        let mut a = app("");
+        a.set_sound(Source::Host, false, false);
+        let rate = 48_000.0;
+        let tone: Vec<f32> = (0..4096).map(|i| 0.8 * (std::f32::consts::TAU * 60.0 * i as f32 / rate).sin()).collect();
+        for _ in 0..20 {
+            a.sound_mut().set_window(&tone, rate);
+            a.frame(0.05, 60, 20, 20.0, 0.01);
+        }
+        let s = a.sound();
+        assert!(s.meter.0 > 0.7, "peak {:?}", s.meter);
+        assert!(s.meter.1 > 0.3, "60 Hz counts as bass {:?}", s.meter);
+        assert!(s.last().unwrap().factor > 1.2 && s.factors().is_empty());
     }
 
     #[test]

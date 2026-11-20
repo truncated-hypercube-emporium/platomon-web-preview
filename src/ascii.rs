@@ -9,6 +9,9 @@ use crate::color::{self, ColorDepth};
 pub const DEFAULT_RAMP: &str = " .,:;-~=+*ox#%&@";
 /// The original 10-level ramp (`--ramp " .:-=+*#%@"`).
 pub const CLASSIC_RAMP: &str = " .:-=+*#%@";
+/// 32 luminance levels: the Consolas glyphs whose measured ink coverage is
+/// closest to 32 evenly spaced steps, darkest first.
+pub const RAMP_32: &str = " `-.':\"~=*+c7ix5ah6HmB80$MWNQg&@";
 
 /// Glyph ramp, darkest first.
 #[derive(Debug, Clone, PartialEq)]

@@ -159,7 +159,8 @@ const METRICS = [
   { key: "disk-dev:D:\\", def: "truncated-cube", on: false },
   { key: "disk-dev:E:\\", def: "truncated-cube", on: false },
 ];
-const RAMPS = { default: " .,:;-~=+*ox#%&@", classic: " .:-=+*#%@", blocks: " ░▒▓█", dots: " ·:∙•●" };
+const RAMPS = { default: " .,:;-~=+*ox#%&@", classic: " .:-=+*#%@", "32-level": " `-.':\"~=*+c7ix5ah6HmB80$MWNQg&@", blocks: " ░▒▓█", dots: " ·:∙•●" };
+const SOUND_SOURCES = ["off", "simulated music", "microphone", "tab / system audio"];
 const GRADIENTS = ["inferno","viridis","plasma","fire","ice","ocean","sunset","matrix","amber","grey","traffic","rainbow"];
 const ASPECTS = ["fill","vga","svga","xga","sxga","wxga","hd","wxga+","fhd","wuxga","qhd","uwfhd","uwqhd","uhd","square","21:9","32:9"];
 
@@ -172,6 +173,13 @@ const SECTIONS = [
     { id: "manual", label: "Manual load", type: "range", min: 0, max: 1, step: 0.01, init: 0.5, fmt: v => Math.round(v * 100) + "%" },
     { id: "simseed", label: "Seed", type: "number", min: 0, max: 99999, step: 1, init: 1 },
   ]},
+  { title: "Sound halo", kind: "sound", open: true, fields: [
+    { id: "sound_source", label: "Sound source", type: "select", options: SOUND_SOURCES, init: "simulated music" },
+    { id: "halo_wide", label: "Size swing", type: "select", options: ["±5%", "±30%"], init: "±5%" },
+    { id: "halo_bands", label: "Bounce source", type: "select", options: ["by frequency", "overall level"], init: "by frequency" },
+  ], hint: "A second wireframe of each solid, 1.2× its size, grows with the sound level; its brightness follows the bass. " +
+           "By frequency: the simplest solid hears the bass, the most complex the treble. " +
+           "Desktop: the platomon-scr screensaver (sound, halo_wide, halo_bands)." },
   { title: "Display", kind: "live", open: true, fields: [
     { id: "font", label: "Font size", type: "range", min: 5, max: 24, step: 1, init: 12, kind: "view", fmt: v => v + " px" },
     { id: "char_auto", label: "Auto cell aspect", type: "check", init: true, kind: "view" },
@@ -359,6 +367,72 @@ function sendSim() {
   W.set_sim(PROFILES.indexOf(values.profile), Number(values.speed), Number(values.manual), Number(values.simseed) >>> 0);
 }
 
+// ------------------------------------------------------------------ sound
+// Captured audio goes through a Web Audio AnalyserNode; every frame its
+// latest 2048 samples are handed to the wasm side, which runs the same
+// peak envelope, FFT and band split as the screensaver.
+let audio = null;   // { ctx, analyser, stream, buf, kind }
+const capturing = () => !!audio;
+
+function stopCapture() {
+  if (!audio) return;
+  for (const t of audio.stream.getTracks()) t.stop();
+  audio.ctx.close().catch(() => {});
+  audio = null;
+}
+
+async function startCapture(kind) {
+  stopCapture();
+  let stream;
+  if (kind === "microphone") {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
+  } else {
+    stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true, systemAudio: "include" });
+    for (const t of stream.getVideoTracks()) t.stop();
+    if (!stream.getAudioTracks().length) {
+      for (const t of stream.getTracks()) t.stop();
+      throw new Error("no audio was shared: pick a tab (or the screen on Windows) and tick 'Share audio'");
+    }
+  }
+  const ctx = new AudioContext();
+  await ctx.resume().catch(() => {});             // may start suspended outside a click
+  const analyser = ctx.createAnalyser();
+  analyser.fftSize = 2048;
+  ctx.createMediaStreamSource(stream).connect(analyser);
+  audio = { ctx, analyser, stream, buf: new Float32Array(2048), kind };
+  for (const t of stream.getAudioTracks()) t.addEventListener("ended", () => {
+    if (audio && audio.stream === stream) { stopCapture(); values.sound_source = "simulated music"; sendSound(false); syncControls(); }
+  });
+}
+
+function pushAudio() {
+  if (!audio) return;
+  audio.analyser.getFloatTimeDomainData(audio.buf);
+  const ptr = W.audio_buffer(audio.buf.length);
+  new Float32Array(W.memory.buffer, ptr, audio.buf.length).set(audio.buf);
+  W.audio_push(audio.buf.length, audio.ctx.sampleRate);
+}
+
+async function sendSound(sourceChanged) {
+  const src = values.sound_source;
+  const wide = values.halo_wide === "±30%" ? 1 : 0, bands = values.halo_bands === "by frequency" ? 1 : 0;
+  if (sourceChanged) {
+    if (src === "microphone" || src === "tab / system audio") {
+      try {
+        if (!navigator.mediaDevices) throw new Error("audio capture needs a secure (https) page");
+        await startCapture(src);
+        $("msg").className = "ok"; $("msg").textContent = "Listening to " + src + ".";
+      } catch (e) {
+        $("msg").className = ""; $("msg").textContent = "Sound: " + (e && e.message || e) + " — using simulated music.";
+        values.sound_source = "simulated music"; syncControls();
+        return sendSound(true);
+      }
+    } else stopCapture();
+  }
+  const idx = values.sound_source === "off" ? 0 : capturing() ? 2 : 1;
+  W.set_sound(idx, wide, bands);
+}
+
 // ------------------------------------------------------------------ UI build
 const $ = id => document.getElementById(id);
 
@@ -420,10 +494,11 @@ function buildUI() {
     const sum = document.createElement("summary"); sum.textContent = s.title;
     const tag = document.createElement("span");
     tag.className = "tag " + (s.kind === "restart" ? "restart" : "live");
-    tag.textContent = s.kind === "restart" ? "on Apply" : s.kind === "sim" ? "instant" : "live";
+    tag.textContent = s.kind === "restart" ? "on Apply" : s.kind === "sim" || s.kind === "sound" ? "instant" : "live";
     sum.append(tag); d.append(sum);
     const body = document.createElement("div"); body.className = "body";
     for (const f of s.fields) body.append(f.type === "metrics" ? metricsControl() : fieldControl(f));
+    if (s.hint) { const h = document.createElement("div"); h.className = "hint"; h.textContent = s.hint; body.append(h); }
     d.append(body); host.append(d);
   }
   syncControls();
@@ -444,6 +519,7 @@ function syncControls() {
   for (const id of ["focus_zoom", "focus_tau"]) $("f-" + id).disabled = values.camera !== "focus";
   for (const id of ["orbit_period", "orbit_dir", "orbit_bob", "orbit_radius", "orbit_height"]) $("f-" + id).disabled = values.camera !== "orbit";
   $("f-manual").disabled = values.profile !== "manual";
+  for (const id of ["halo_wide", "halo_bands"]) $("f-" + id).disabled = values.sound_source === "off";
   document.querySelectorAll("table.metrics tbody tr").forEach(tr => {
     const r = metricRows[tr.dataset.i]; const [on, so, ri] = tr.querySelectorAll("input,select");
     on.checked = r.on; so.value = r.solid; ri.value = r.ring;
@@ -454,7 +530,7 @@ function syncControls() {
 function pendingIds() {
   const p = new Set();
   for (const id in FIELDS) {
-    const f = FIELDS[id]; if (f.type === "metrics" || f.kind === "sim" || f.kind === "view") continue;
+    const f = FIELDS[id]; if (f.type === "metrics" || f.kind === "sim" || f.kind === "sound" || f.kind === "view") continue;
     const needsApply = f.kind === "restart" || !liveMode;
     if (needsApply && String(values[id]) !== String(applied[id])) p.add(id);
   }
@@ -484,6 +560,7 @@ function onChange(f) {
   if (f.id === "min_scale" && values.max_scale < values.min_scale) values.max_scale = values.min_scale;
   if (f.id === "max_scale" && values.min_scale > values.max_scale) values.min_scale = values.max_scale;
   if (f.kind === "sim") sendSim();
+  if (f.kind === "sound") sendSound(f.id === "sound_source");
   if (f.id === "font" || f.id === "char_auto") measure();
   if (liveMode && (f.kind === "live" || f.id === "ramp_preset" || f.id === "color_preset" || f.id === "char_auto" || f.id === "font")) applyLive();
   syncControls();
@@ -521,14 +598,30 @@ function measure() {
 // ------------------------------------------------------------------ frame loop
 let last = performance.now(), lastDrawn = last, achieved = 0, lastRender = 0.01, renderMs = 0;
 const hist = [];
+let lastHalo = 0, haloCount = 0, haloRate = 0, haloWindow = performance.now();
 function loop(now) {
   requestAnimationFrame(loop);
-  if (!W || paused) { last = now; return; }
+  if (!W || paused) { last = now; lastHalo = now; return; }
   const target = W.target_fps();
   const since = (now - lastDrawn) / 1000;
-  if (since < 1 / target - 0.002) return;          // pace to platomon's target fps
+  if (since < 1 / target - 0.002) {                 // pace to platomon's target fps
+    // Between full frames: halo-only redraw at the display rate (capped at fps_max).
+    if (values.sound_source !== "off" && (now - lastHalo) / 1000 >= 1 / Math.max(1, values.fps_max) - 0.002) {
+      const hdt = Math.min(0.25, (now - lastHalo) / 1000);
+      lastHalo = now;
+      pushAudio();
+      const hl = W.halo_frame(hdt);
+      if (hl) {
+        const ncol = W.colors_len();
+        paint(dec.decode(new Uint8Array(W.memory.buffer, W.output_ptr(), hl)), ncol ? new Uint32Array(W.memory.buffer, W.colors_ptr(), ncol) : null);
+        haloCount++;
+      }
+    }
+    return;
+  }
   const dt = Math.min(0.25, since);
-  lastDrawn = now;
+  lastDrawn = now; lastHalo = now;
+  pushAudio();
   if (dt > 0) achieved += (1 / dt - achieved) * (1 - Math.exp(-dt / 0.5));
   const t0 = performance.now();
   const len = W.frame(dt, cols, rows, achieved, lastRender);
@@ -565,10 +658,17 @@ function paint(text, colors) {
 
 function status(target) {
   const qv = W.quality();
+  const tnow = performance.now();
+  if (tnow - haloWindow > 1000) { haloRate = haloCount * 1000 / (tnow - haloWindow); haloCount = 0; haloWindow = tnow; }
+  const pct = v => Math.round(Math.min(1, v) * 100) + "%";
+  const snd = values.sound_source === "off" ? "sound <b>off</b>" :
+    `sound <b>${audio ? audio.kind : "simulated"}</b> · peak ${pct(W.sound_info(0))} · bass ${pct(W.sound_info(1))}` +
+    ` · halo <b>${W.sound_info(2).toFixed(2)}×</b> lum ${W.sound_info(3).toFixed(2)} · ${Math.round(haloRate)} halo-only/s`;
   $("status").innerHTML =
     `<b>${Math.round(achieved)}</b> fps drawn · target <b>${Math.round(target)}</b> · render <b>${renderMs.toFixed(1)}</b> ms` +
     (qv ? ` · quality <b>q-${qv}</b>` : "") +
     `<br>grid <b>${cols}×${rows}</b> · cell ${cellW.toFixed(1)}×${cellH.toFixed(1)} px · sim <b>${values.profile}</b> ${Math.round(W.sim_load() * 100)}%` +
+    `<br>${snd}` +
     `<br><span class="hint">The browser caps drawing at the display refresh rate.</span>`;
 }
 
@@ -612,7 +712,7 @@ $("toggle").onclick = () => $("panel").classList.toggle("hidden");
 $("mode-live").onclick = () => setMode(true);
 $("mode-manual").onclick = () => setMode(false);
 $("apply").onclick = applyRestart;
-$("reset").onclick = () => { initValues(); measure(); buildUI(); sendSim(); applyRestart(); };
+$("reset").onclick = () => { initValues(); measure(); buildUI(); sendSim(); sendSound(true); applyRestart(); };
 $("copy-cli").onclick = () => navigator.clipboard?.writeText($("cli").value);
 $("copy-toml").onclick = () => navigator.clipboard?.writeText($("toml").value);
 let resizeTimer = 0;
@@ -628,6 +728,7 @@ window.addEventListener("resize", () => {
     buildUI();
     await loadWasm();
     sendSim();
+    sendSound(false);
     applyRestart();
     $("msg").textContent = "";
     requestAnimationFrame(loop);

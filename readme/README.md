@@ -38,11 +38,21 @@ The settings panel (`g`) covers every option and shows each one's scope:
 | Tag | When it takes effect |
 |---|---|
 | **instant** | simulated load: profile (`cycle`, `bursts`, `ramp`, `steps`, `idle`, `stress`, `manual`), speed, manual level, seed |
+| **instant** | sound halo: source, size swing, bounce source |
 | **live** | display, legend & wireframe, colour, frame rate, rendering, background, animation — applied as you change them |
 | **on Apply** | metrics, solids, rings, layout, camera (incl. focus zoom / glide), smoothing, sensor rate — **Apply & restart** rebuilds the scene |
 
 Switch the panel to **On Apply only** to hold every change until Apply. Changed-but-not-applied
 settings are highlighted, and the panel shows the equivalent desktop command and `config.toml`.
+**Sound halo** (from the `platomon-scr` screensaver): a second wireframe of each solid, 1.2x its
+size, grows and shrinks with the sound level (±5% of the radius, or ±30% with the wide swing) and
+gets brighter with the bass. *By frequency* (default) gives each solid its own slice of a 12-band
+FFT: the simplest solid in the scene hears the bass, the most complex the treble. The halo is redrawn
+on its own between full frames, up to the frame-rate cap. Sources: **simulated music** (default; a
+built-in 120 bpm track whose sections favour bass, mids or treble in turn), **microphone**, or
+**tab / system audio** (screen-share picker: tick *Share audio*; system audio is offered on Windows
+and ChromeOS). Capture needs the https page and stays in the browser.
+
 Colour gradients are drawn as coloured text; with `256` depth the page shows the xterm palette entry a
 256-colour terminal would use.
 The simulated machine has adapters `Ethernet`, `Wi-Fi`, `vEthernet` and disks `C:\`, `D:\`, `E:\`.
