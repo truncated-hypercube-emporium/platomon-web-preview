@@ -14,12 +14,41 @@ pub struct TraceSettings {
     pub bounces: u32,
     pub max_steps: u32,
     pub max_dist: f32,
+    /// Ground hits further than this get the cheap far shading
+    /// ([`far_ground_radiance`]): no light sampling, shadows or bounces.
+    pub detail_dist: f32,
 }
 
 impl Default for TraceSettings {
     fn default() -> Self {
-        Self { bounces: 2, max_steps: 64, max_dist: 50.0 }
+        Self { bounces: 2, max_steps: 64, max_dist: 50.0, detail_dist: f32::INFINITY }
     }
+}
+
+/// Extended floor: how much further out the ground is drawn.
+pub const FAR_GROUND_FACTOR: f32 = 8.0;
+
+impl TraceSettings {
+    /// With the extended floor: the ground drawn `FAR_GROUND_FACTOR` times
+    /// further out, everything past the normal distance shaded cheaply.
+    pub fn with_far_ground(self, on: bool) -> Self {
+        if on { Self { max_dist: self.max_dist * FAR_GROUND_FACTOR, detail_dist: self.max_dist, ..self } } else { self }
+    }
+}
+
+/// Radiance of a far ground point `p` with albedo `albedo`, without any
+/// sampling: the light's direct contribution in closed form (an unoccluded
+/// sphere light over a horizontal surface; solids' shadows never reach this
+/// far) plus the averaged sky term the path tracer uses for truncated
+/// paths. The pattern has already faded to its mean tone out here.
+#[inline]
+pub fn far_ground_radiance(scene: &Scene, p: Vec3A, albedo: f32) -> f32 {
+    let l = &scene.light;
+    let to = l.center - p;
+    let d = to.length().max(l.radius * 1.001);
+    let cos_max = (1.0 - (l.radius / d).powi(2)).max(0.0).sqrt();
+    let ndl = (to.y / d).max(0.0);
+    albedo * (l.emission * ndl * 2.0 * (1.0 - cos_max) + scene.sky * AMBIENT_OCCLUSION)
 }
 
 /// Offset along the normal for secondary-ray origins.
@@ -173,6 +202,11 @@ pub fn radiance_primary(
         };
 
         let p = ro + rd * h.t;
+        if h.id == GROUND && h.t > s.detail_dist {
+            // Extended floor beyond the normal distance: averaged, closed form.
+            acc += throughput * far_ground_radiance(scene, p, scene.ground.albedo(p, h.t));
+            break;
+        }
         let n = normal(scene, h.id, p);
         let albedo = if h.id == GROUND { scene.ground.albedo(p, h.t) } else { scene.solids[h.id as usize].albedo };
         let origin = p + n * RAY_OFFSET;
@@ -199,6 +233,25 @@ pub fn radiance_primary(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn far_ground_matches_the_sampled_average() {
+        use crate::scene::{AnimParams, Scene};
+        let s = Scene::demo(&AnimParams::default());
+        let ts = TraceSettings { bounces: 0, ..TraceSettings::default() };
+        let mut rng = fastrand::Rng::with_seed(11);
+        // a ground point well away from the solids: sampled direct light + sky term
+        for p in [Vec3A::new(30.0, 0.0, -25.0), Vec3A::new(-60.0, 0.0, 40.0)] {
+            let origin = p + Vec3A::Y * RAY_OFFSET;
+            let n = 20_000;
+            let sampled: f32 = (0..n).map(|_| direct_light(&s, origin, Vec3A::Y, &mut rng, &ts, ALL_SOLIDS)).sum::<f32>() / n as f32;
+            let exact = far_ground_radiance(&s, p, 1.0) - s.sky * AMBIENT_OCCLUSION;
+            assert!((sampled - exact).abs() < 0.03 * exact.max(1e-3) + 1e-4, "{p:?}: sampled {sampled} vs closed form {exact}");
+        }
+        let far = TraceSettings::default().with_far_ground(true);
+        assert_eq!((far.max_dist, far.detail_dist), (50.0 * FAR_GROUND_FACTOR, 50.0));
+        assert_eq!(TraceSettings::default().with_far_ground(false), TraceSettings::default());
+    }
 
     #[test]
     fn onb_is_orthonormal() {

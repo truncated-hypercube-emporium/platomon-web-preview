@@ -175,13 +175,13 @@ const SECTIONS = [
   ]},
   { title: "Sound halo", kind: "sound", open: true, fields: [
     { id: "sound_source", label: "Sound source", type: "select", options: SOUND_SOURCES, init: "simulated music" },
-    { id: "halo_wide", label: "Size swing", type: "select", options: ["±5%", "±30%"], init: "±5%" },
+    { id: "halo_wide", label: "Size swing", type: "select", options: ["±10%", "±30%", "±60%"], init: "±10%" },
     { id: "halo_bands", label: "Bounce source", type: "select", options: ["by frequency", "overall level"], init: "by frequency" },
-  ], hint: "A second wireframe of each solid, 1.2× its size, grows with the sound level; its brightness follows the bass. " +
+  ], hint: "A second wireframe of each solid, 1.2× its size, grows with the sound level; its brightness follows the bass; tags keep clear of its largest size. " +
            "By frequency: the simplest solid hears the bass, the most complex the treble. " +
            "Desktop: the platomon-scr screensaver (sound, halo_wide, halo_bands)." },
   { title: "Display", kind: "live", open: true, fields: [
-    { id: "font", label: "Font size", type: "range", min: 5, max: 24, step: 1, init: 12, kind: "view", fmt: v => v + " px" },
+    { id: "font", label: "Font size", type: "range", min: 4, max: 24, step: 1, init: 6, kind: "view", fmt: v => v + " px" },
     { id: "char_auto", label: "Auto cell aspect", type: "check", init: false, kind: "view" },
     { id: "char_aspect", label: "Cell aspect", type: "range", min: 0.3, max: 1, step: 0.01, init: 0.55, def: 0.5, flag: "--char-aspect" },
     { id: "aspect", label: "Aspect", type: "select", options: ASPECTS, init: "sxga", def: "fill", flag: "--aspect" },
@@ -200,13 +200,15 @@ const SECTIONS = [
     { id: "tag_color_mode", label: "Tag colour", type: "select", options: ["complement","theme","white","custom"], init: "complement", kind: "view" },
     { id: "tag_color", label: "Tag hex", type: "text", init: "complement", def: "complement", flag: "--tag-color", placeholder: "#RRGGBB" },
     { id: "tag_blocks", label: "Block letters", type: "check", init: true, def: false, flag: "--tag-blocks" },
+    { id: "tag_fixed_len", label: "Fixed tag length", type: "check", init: false, def: false, flag: "--tag-fixed-length" },
     { id: "wireframe", label: "Wireframe", type: "check", init: false, def: false, flag: "--wireframe" },
   ]},
   { title: "Colour", kind: "live", fields: [
     { id: "color_preset", label: "Gradient", type: "select", options: ["off", ...GRADIENTS, "custom"], init: "off", kind: "view" },
     { id: "color", label: "Hex stops", type: "text", init: "off", def: "off", flag: "--color", placeholder: "#000:#f80:#fff" },
-    { id: "color_by", label: "Colour by", type: "select", options: ["lum","load"], init: "lum", def: "lum", flag: "--color-by" },
-    { id: "color_depth", label: "Depth", type: "select", options: ["24bit","256"], init: "24bit", def: "24bit", flag: "--color-depth" },
+    { id: "color_by", label: "Colour by", type: "select", options: ["lum","load","spin","sound"], init: "lum", def: "lum", flag: "--color-by" },
+    { id: "colors", label: "Palette", type: "select", options: ["16","32","64","128"], init: "16", def: "16", flag: "--colors", fmt: v => v + " colours" },
+    { id: "bg_color", label: "Background colour", type: "select", options: ["auto","off","match", ...GRADIENTS], init: "auto", def: "auto", flag: "--bg-color" },
     { id: "color_reverse", label: "Reverse", type: "check", init: false, def: false, flag: "--color-reverse" },
   ]},
   { title: "Frame rate", kind: "live", fields: [
@@ -235,6 +237,7 @@ const SECTIONS = [
     { id: "bg_sway_period", label: "Sway period", type: "range", min: 1, max: 60, step: 1, init: 10, def: 10, flag: "--bg-sway-period", fmt: v => v + " s" },
     { id: "bg_rotate", label: "Rotate", type: "select", options: ["off","cw","ccw"], init: "off", def: "off", flag: "--bg-rotate" },
     { id: "bg_rotate_period", label: "Rotate period", type: "range", min: 2, max: 120, step: 1, init: 60, def: 60, flag: "--bg-rotate-period", fmt: v => v + " s" },
+    { id: "far_ground", label: "Extended floor", type: "check", init: false, def: false, flag: "--far-ground" },
   ]},
   { title: "Animation", kind: "live", fields: [
     { id: "min_scale", label: "Min scale", type: "range", min: 0.05, max: 1, step: 0.05, init: 0.45, def: 0.45 },
@@ -245,7 +248,8 @@ const SECTIONS = [
   { title: "Scene & camera", kind: "restart", fields: [
     { id: "metrics", type: "metrics" },
     { id: "layout", label: "Layout", type: "select", options: ["rings","sphere"], init: "rings", def: "rings", flag: "--layout" },
-    { id: "camera", label: "Camera", type: "select", options: ["static","orbit","focus"], init: "orbit", def: "static", flag: "--camera" },
+    { id: "camera", label: "Camera", type: "select", options: ["static","orbit","focus","tilt","resonance"], init: "orbit", def: "static", flag: "--camera" },
+    { id: "auto_distance", label: "Auto distance", type: "check", init: false, def: false, flag: "--auto-distance" },
     { id: "focus_zoom", label: "Focus zoom", type: "range", min: 0, max: 1, step: 0.05, init: 0.6, def: 0.6, flag: "--focus-zoom" },
     { id: "focus_tau", label: "Focus glide", type: "range", min: 0.1, max: 10, step: 0.1, init: 1.5, def: 1.5, flag: "--focus-tau", fmt: v => v + " s" },
     { id: "orbit_period", label: "Orbit period", type: "range", min: 5, max: 300, step: 5, init: 60, def: 60, flag: "--orbit-period", fmt: v => v + " s" },
@@ -291,18 +295,20 @@ function tomlFor(v, rows, seed) {
          "show_stats = " + !!v.show_stats, "aspect = " + q(v.aspect), "aspect_mode = " + q(v.aspect_mode));
   L.push("legend = " + !!v.legend, "legend_size = " + int(v.legend_size), "legend_opacity = " + num(v.legend_opacity),
          "legend_pos = " + q(v.legend_pos), "wireframe = " + !!v.wireframe,
-         "tags = " + !!v.tags, "tag_color = " + q(v.tag_color || "complement"), "tag_blocks = " + !!v.tag_blocks);
-  L.push("color = " + q(v.color || "off"), "color_by = " + q(v.color_by), "color_depth = " + q(v.color_depth),
+         "tags = " + !!v.tags, "tag_color = " + q(v.tag_color || "complement"), "tag_blocks = " + !!v.tag_blocks, "tag_fixed_len = " + !!v.tag_fixed_len);
+  L.push("color = " + q(v.color || "off"), "color_by = " + q(v.color_by), "colors = " + int(v.colors), "bg_color = " + q(v.bg_color),
          "color_reverse = " + !!v.color_reverse, "layout = " + q(v.layout));
   L.push("camera = " + q(v.camera), "orbit_period = " + num(v.orbit_period), "orbit_dir = " + q(v.orbit_dir),
-         "orbit_bob = " + num(v.orbit_bob), "focus_zoom = " + num(v.focus_zoom), "focus_tau = " + num(v.focus_tau));
+         "orbit_bob = " + num(v.orbit_bob), "focus_zoom = " + num(v.focus_zoom), "focus_tau = " + num(v.focus_tau),
+         "auto_distance = " + !!v.auto_distance);
   if (v.orbit_radius !== "" && v.orbit_radius != null) L.push("orbit_radius = " + num(v.orbit_radius));
   if (v.orbit_height !== "" && v.orbit_height != null) L.push("orbit_height = " + num(v.orbit_height));
   if (seed != null) L.push("seed = " + int(seed));
   L.push("bg_lum = " + num(v.bg_lum), "bg_pattern = " + q(v.bg_pattern), "bg_contrast = " + num(v.bg_contrast),
          "bg_scale = " + num(v.bg_scale), "bg_scroll = [" + num(v.bg_scroll_x) + ", " + num(v.bg_scroll_z) + "]",
          "bg_sway = " + num(v.bg_sway), "bg_sway_period = " + num(v.bg_sway_period), "bg_rotate = " + q(v.bg_rotate),
-         "bg_rotate_period = " + num(v.bg_rotate_period), "bg_waves = " + int(v.bg_waves), "bg_wave_speed = " + num(v.bg_wave_speed));
+         "bg_rotate_period = " + num(v.bg_rotate_period), "bg_waves = " + int(v.bg_waves), "bg_wave_speed = " + num(v.bg_wave_speed),
+         "far_ground = " + !!v.far_ground);
   L.push("min_scale = " + num(v.min_scale), "max_scale = " + num(v.max_scale), "idle_spin = " + num(v.idle_spin),
          "max_spin = " + num(v.max_spin), "smoothing_tau = " + num(v.smoothing_tau), "poll_hz = " + num(v.poll_hz));
   const solids = shown.filter(r => r.solid !== r.def), rings = shown.filter(r => r.ring !== "auto");
@@ -320,7 +326,7 @@ function cliFor(v, rows) {
   if (shown.map(r => r.key).join(",") !== defShow.join(",")) a.push("--show", psQuote(shown.map(r => r.key).join(",")));
   for (const r of shown) if (r.solid !== r.def) a.push("--solid", psQuote(r.key + "=" + r.solid));
   for (const r of shown) if (r.ring !== "auto") a.push("--ring", psQuote(r.key + "=" + r.ring));
-  let configOnly = 0;
+  let configOnly = 0, soundOnly = false;
   for (const id in FIELDS) {
     const f = FIELDS[id];
     if (!("def" in f) || f.type === "metrics") continue;
@@ -329,11 +335,13 @@ function cliFor(v, rows) {
     if (same) continue;
     if (!f.flag) { if (!(id === "char_aspect" && v.char_auto)) configOnly++; continue; }
     if (f.type === "check") { if (val) a.push(f.flag); else configOnly++; continue; }
+    if (id === "color_by" && val === "sound") { soundOnly = true; continue; }
     if (id === "legend_pos") { a.push(f.flag, { "top-left": "tl", "top-right": "tr", "bottom-left": "bl", "bottom-right": "br" }[val]); continue; }
     a.push(f.flag, psQuote(String(val)));
   }
   if (v.bg_scroll_x != 0 || v.bg_scroll_z != 0) a.push("--bg-scroll", v.bg_scroll_x + ":" + v.bg_scroll_z);
-  return a.join(" ") + (configOnly ? `\n# + ${configOnly} setting(s) with no flag: use the config.toml below with --config` : "");
+  return a.join(" ") + (configOnly ? `\n# + ${configOnly} setting(s) with no flag: use the config.toml below with --config` : "") +
+    (soundOnly ? "\n# colour by sound: only the web preview and the platomon-scr screensaver hear sound" : "");
 }
 
 // ------------------------------------------------------------------ wasm
@@ -422,7 +430,7 @@ function pushAudio() {
 
 async function sendSound(sourceChanged) {
   const src = values.sound_source;
-  const wide = values.halo_wide === "±30%" ? 1 : 0, bands = values.halo_bands === "by frequency" ? 1 : 0;
+  const wide = Math.max(0, ["±10%", "±30%", "±60%"].indexOf(values.halo_wide)), bands = values.halo_bands === "by frequency" ? 1 : 0;
   if (sourceChanged) {
     if (src === "microphone" || src === "tab / system audio") {
       try {
@@ -525,9 +533,11 @@ function syncControls() {
   $("f-tag_color").disabled = values.tag_color_mode !== "custom" || !values.tags;
   for (const id of ["tag_color_mode", "tag_blocks"]) $("f-" + id).disabled = !values.tags;
   for (const id of ["bg_waves", "bg_wave_speed"]) $("f-" + id).disabled = values.bg_pattern !== "quasicrystal";
-  for (const id of ["color_by", "color_depth", "color_reverse"]) $("f-" + id).disabled = values.color === "off";
+  for (const id of ["color_by", "color_reverse"]) $("f-" + id).disabled = values.color === "off";
+  $("f-tag_fixed_len").disabled = !values.tags;
+  $("f-auto_distance").disabled = values.camera === "focus";
   for (const id of ["focus_zoom", "focus_tau"]) $("f-" + id).disabled = values.camera !== "focus";
-  for (const id of ["orbit_period", "orbit_dir", "orbit_bob", "orbit_radius", "orbit_height"]) $("f-" + id).disabled = values.camera !== "orbit";
+  for (const id of ["orbit_period", "orbit_dir", "orbit_bob", "orbit_radius", "orbit_height"]) $("f-" + id).disabled = !["orbit", "tilt", "resonance"].includes(values.camera);
   $("f-manual").disabled = values.profile !== "manual";
   for (const id of ["halo_wide", "halo_bands"]) $("f-" + id).disabled = values.sound_source === "off";
   document.querySelectorAll("table.metrics tbody tr").forEach(tr => {

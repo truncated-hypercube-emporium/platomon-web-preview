@@ -24,6 +24,10 @@ pub const SPACING: f32 = 2.0 * BASE_RADIUS + 0.6;
 pub const RING_CAPACITY: usize = 8;
 /// Gap between a solid's circumsphere and the ground.
 pub const HOVER: f32 = 0.08;
+/// Solids float so that even the largest halo (1.8x the radius, the ±60%
+/// swing) stays this far above the ground.
+pub const HALO_REACH_MAX: f32 = 1.8;
+pub const FLOAT_GAP: f32 = 0.1;
 /// Layout extent the light and camera were tuned for (default 5-solid ring).
 const REF_EXTENT: f32 = MIN_RING_RADIUS + BASE_RADIUS;
 
@@ -247,6 +251,10 @@ pub struct Scene {
     pub solids: Vec<Instance>,
     /// (pitch, yaw) per solid, radians.
     pub angles: Vec<(f32, f32)>,
+    /// (pitch, yaw) rates per solid this frame, radians/s.
+    pub spin_rates: Vec<(f32, f32)>,
+    /// Fastest possible angular speed, radians/s (normalises spin colours).
+    pub spin_max: f32,
     pub ring_pos: Vec<Vec3A>,
     pub ring_index: Vec<usize>,
     pub centroid: Vec3A,
@@ -291,6 +299,23 @@ impl Scene {
         };
         let extent = ring_pos.iter().map(|p| (*p - centroid).length()).fold(0.0, f32::max)
             + BASE_RADIUS * anim.max_scale;
+        // Float the solids so their largest halo clears the ground: rings
+        // hover at a fixed height (the camera's aim rises with them); a
+        // sphere of shells is lifted if its lowest halo would dip below.
+        let max_r = BASE_RADIUS * anim.max_scale.max(anim.min_scale);
+        let float_y = max_r * HALO_REACH_MAX + FLOAT_GAP;
+        let (mut ring_pos, mut centroid) = (ring_pos, centroid);
+        match layout {
+            Layout::Rings => centroid.y += float_y - (max_r + HOVER),
+            Layout::Sphere => {
+                let low = ring_pos.iter().map(|p| p.y).fold(f32::INFINITY, f32::min) - max_r * HALO_REACH_MAX;
+                let lift = (FLOAT_GAP - low).max(0.0);
+                for p in &mut ring_pos {
+                    p.y += lift;
+                }
+                centroid.y += lift;
+            }
+        }
         let k = extent / REF_EXTENT;
 
         let solids = slots
@@ -311,7 +336,11 @@ impl Scene {
         // so the camera framing tuned for rings needs to back off for shells.
         let frame_extent = if layout == Layout::Sphere { extent * SPHERE_FRAMING } else { extent };
         let rig = CameraRig::new(cam, centroid, frame_extent);
+        let span = (anim.max_spin - anim.idle_spin).max(0.0);
+        let spin_max = (anim.idle_spin + span).hypot(0.5 * anim.idle_spin + span).max(1e-3);
         let mut s = Self {
+            spin_rates: vec![(0.0, 0.0); slots.len()],
+            spin_max,
             solids,
             angles,
             ring_pos,
@@ -356,22 +385,29 @@ impl Scene {
 
     fn set_scale(&mut self, i: usize, scale: f32) {
         let r = (scale * BASE_RADIUS).max(1e-3);
+        let float_y = self.float_y();
         let inst = &mut self.solids[i];
         inst.scale = r;
         inst.inv_scale = 1.0 / r;
         inst.center = if self.grounded {
-            // Rest just above the ground at every scale so contact shadows stay visible.
-            self.ring_pos[i] + Vec3A::new(0.0, r + HOVER, 0.0)
+            // Float at a fixed height whatever the size, high enough that the
+            // largest halo never dips into the ground.
+            self.ring_pos[i] + Vec3A::new(0.0, float_y, 0.0)
         } else {
             self.ring_pos[i]
         };
     }
 
-    /// Where solid `i`'s centre is when it is at full size (rings: solids
-    /// rest on the ground, so a bigger solid sits higher).
+    /// Rings: the height every solid's centre floats at.
+    pub fn float_y(&self) -> f32 {
+        self.max_radius * HALO_REACH_MAX + FLOAT_GAP
+    }
+
+    /// Where solid `i`'s centre is when it is at full size (rings float at
+    /// a fixed height, so this is where it always is).
     pub fn full_size_center(&self, i: usize) -> Vec3A {
         let p = self.ring_pos.get(i).copied().unwrap_or(self.centroid);
-        if self.grounded { p + Vec3A::new(0.0, self.max_radius + HOVER, 0.0) } else { p }
+        if self.grounded { p + Vec3A::new(0.0, self.float_y(), 0.0) } else { p }
     }
 
     /// Slot the focus camera is on (or heading to).
@@ -416,6 +452,34 @@ impl Scene {
         self.slab_top = top + 1e-2;
     }
 
+    /// Each solid's spin as a colour value 0..=1, written to `out`: 0.5 =
+    /// still or spinning edge-on to the camera, toward 1 = faster
+    /// counter-clockwise as seen from the camera, toward 0 = faster clockwise.
+    pub fn spin_values(&self, out: &mut Vec<f32>) {
+        out.clear();
+        let eye = self.camera.pos;
+        for (i, s) in self.solids.iter().enumerate() {
+            let (pr, yr) = self.spin_rates.get(i).copied().unwrap_or_default();
+            let yaw = self.angles.get(i).map_or(0.0, |a| a.1);
+            // R = Ry(yaw) * Rx(pitch): world angular velocity
+            let w = Vec3A::Y * yr + Mat3A::from_rotation_y(yaw) * Vec3A::X * pr;
+            let view = (eye - s.center).normalize_or_zero();
+            out.push((0.5 + 0.5 * w.dot(view) / self.spin_max).clamp(0.0, 1.0));
+        }
+    }
+
+    /// Per-solid colour values for `by`, written to `out`: spin from
+    /// [`Scene::spin_values`], otherwise each channel's load (unavailable =
+    /// 0). Sound values come from the caller's meter.
+    pub fn color_values(&self, by: crate::color::ColorBy, channels: &[Channel], out: &mut Vec<f32>) {
+        if by == crate::color::ColorBy::Spin {
+            self.spin_values(out);
+        } else {
+            out.clear();
+            out.extend(channels.iter().map(|c| if c.available { c.level } else { 0.0 }));
+        }
+    }
+
     /// Drive scale and spin from smoothed channels and move the camera;
     /// everything uses wall-clock `dt`.
     pub fn update(&mut self, channels: &[Channel], anim: &AnimParams, dt: f32) {
@@ -427,6 +491,9 @@ impl Scene {
             self.set_scale(i, scale);
             let yaw_rate = anim.idle_spin + span * sy.clamp(0.0, 1.0);
             let pitch_rate = 0.5 * anim.idle_spin + span * sx.clamp(0.0, 1.0);
+            if let Some(r) = self.spin_rates.get_mut(i) {
+                *r = (pitch_rate, yaw_rate);
+            }
             let (p, y) = &mut self.angles[i];
             *p = (*p + pitch_rate * dt).rem_euclid(TAU);
             *y = (*y + yaw_rate * dt).rem_euclid(TAU);
@@ -435,6 +502,10 @@ impl Scene {
         self.update_focus(channels, dt);
         let target = self.focus.and_then(|i| self.solids.get(i)).map(|s| s.center);
         self.rig.advance(dt, target);
+        if self.rig.auto_distance() {
+            let spheres: Vec<(Vec3A, f32)> = self.solids.iter().map(|s| (s.center, s.scale)).collect();
+            self.rig.fit(&spheres, dt);
+        }
         self.camera = self.rig.camera();
         self.ground.advance(dt);
     }
@@ -573,8 +644,33 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_uses_min_scale_and_idle_spin() {
+    fn spin_values_follow_speed_and_direction_seen_from_the_camera() {
         let anim = AnimParams::default();
+        let mut s = Scene::demo(&anim);
+        let mut v = Vec::new();
+        s.spin_values(&mut v);
+        assert!(v.iter().all(|&x| x == 0.5), "before any update: still");
+        let still = vec![Channel { available: true, level: 0.5, spin_y: 0.0, spin_x: 0.0, activity: 0.0 }; s.solids.len()];
+        s.update(&still, &anim, 0.016);
+        s.spin_values(&mut v);
+        let idle: Vec<f32> = v.iter().map(|x| (x - 0.5).abs()).collect();
+        s.update(&full(s.solids.len()), &anim, 0.016);
+        s.spin_values(&mut v);
+        for (i, (&x, &calm)) in v.iter().zip(&idle).enumerate() {
+            assert!((0.0..=1.0).contains(&x), "{i}: {x}");
+            assert!((x - 0.5).abs() > calm, "{i}: full spin {x} further from still than idle ({calm})");
+        }
+        // the sign is the direction seen from the camera: from the other side it flips
+        let eye = s.camera.pos;
+        let c = s.solids[0].center;
+        s.camera.pos = c - (eye - c);
+        let mut back = Vec::new();
+        s.spin_values(&mut back);
+        assert!(((back[0] - 0.5) + (v[0] - 0.5)).abs() < 1e-4, "{} vs {}", back[0], v[0]);
+    }
+
+    #[test]
+    fn unavailable_uses_min_scale_and_idle_spin() {        let anim = AnimParams::default();
         let mut s = Scene::demo(&anim);
         let before = s.angles[4];
         let off = vec![Channel { available: false, level: 1.0, spin_y: 1.0, spin_x: 1.0, activity: 1.0 }; 5];

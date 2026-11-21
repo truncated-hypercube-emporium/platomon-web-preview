@@ -7,7 +7,7 @@
 //! brightness, and per-solid bands along the frequency gradient.
 
 use platomon::audio::{Analyzer, Envelope, FFT_N, SolidLevels, bass_weighted, frequency_gradient};
-use platomon::overlay::{Halo, halo_factor, halo_lum};
+use platomon::overlay::{HALO_SWINGS, Halo, halo_factor, halo_lum, halo_reach};
 use platomon::scene::Scene;
 
 /// Where the samples come from.
@@ -38,14 +38,18 @@ pub const SIM_RATE: f32 = 48_000.0;
 /// Halo state between frames.
 pub struct SoundHalo {
     pub source: Source,
-    /// Halo size swing ±30% instead of ±5%.
-    pub wide: bool,
+    /// Halo size swing, a share of the radius either way (see
+    /// [`HALO_SWINGS`]).
+    pub swing: f32,
     /// Each solid's halo follows its own band (simple solids bass, complex
     /// ones treble); off = one size from the overall level.
     pub bands_on: bool,
     size: Envelope,
     bass: Envelope,
     solid: SolidLevels,
+    /// Per-solid band levels for `color_by = "sound"` (always by frequency).
+    colour: SolidLevels,
+    colour_levels: Vec<f32>,
     analyzer: Analyzer,
     /// The latest `FFT_N` samples (mono) and their rate.
     window: Vec<f32>,
@@ -64,11 +68,13 @@ impl Default for SoundHalo {
     fn default() -> Self {
         Self {
             source: Source::Sim,
-            wide: false,
+            swing: HALO_SWINGS[0],
             bands_on: true,
             size: Envelope::new(),
             bass: Envelope::new(),
             solid: SolidLevels::new(Vec::new()),
+            colour: SolidLevels::new(Vec::new()),
+            colour_levels: Vec::new(),
             analyzer: Analyzer::new(),
             window: vec![0.0; FFT_N],
             rate: SIM_RATE,
@@ -83,7 +89,7 @@ impl Default for SoundHalo {
 
 impl SoundHalo {
     /// Settings from the page; places come from the scene's solids.
-    pub fn configure(&mut self, source: Source, wide: bool, bands_on: bool, scene: &Scene) {
+    pub fn configure(&mut self, source: Source, swing: f32, bands_on: bool, scene: &Scene) {
         if source != self.source {
             // Fresh auto-gain for a new source.
             self.size = Envelope::new();
@@ -92,7 +98,10 @@ impl SoundHalo {
             self.peak = 0.0;
         }
         self.source = source;
-        self.wide = wide;
+        self.swing = if swing.is_finite() { swing.clamp(0.0, 1.0) } else { HALO_SWINGS[0] };
+        if self.colour.places().len() != scene.solids.len() {
+            self.colour = SolidLevels::new(self.places_for(scene, true));
+        }
         if bands_on != self.bands_on || self.solid.places().len() != self.places_for(scene, bands_on).len() {
             self.bands_on = bands_on;
             self.reset_places(scene);
@@ -115,6 +124,7 @@ impl SoundHalo {
     /// scene rebuild).
     pub fn reset_places(&mut self, scene: &Scene) {
         self.solid = SolidLevels::new(self.places_for(scene, self.bands_on));
+        self.colour = SolidLevels::new(self.places_for(scene, true));
     }
 
     /// The page's latest capture: the newest samples (any length; the last
@@ -138,6 +148,7 @@ impl SoundHalo {
         if self.source == Source::Off {
             self.last = None;
             self.factors.clear();
+            self.colour_levels.clear();
             return None;
         }
         let dt = if dt.is_finite() { dt.clamp(0.0, 0.25) } else { 0.0 };
@@ -162,9 +173,11 @@ impl SoundHalo {
         let size = self.size.update(raw_peak, dt);
         let bass = self.bass.update(bw, dt);
         self.factors.clear();
-        let wide = self.wide;
-        self.factors.extend(self.solid.update(&bands, dt).iter().map(|&l| halo_factor(l, wide)));
-        let halo = Halo { factor: halo_factor(size, wide), lum: halo_lum(bass) };
+        let swing = self.swing;
+        self.factors.extend(self.solid.update(&bands, dt).iter().map(|&l| halo_factor(l, swing)));
+        self.colour_levels.clear();
+        self.colour_levels.extend_from_slice(self.colour.update(&bands, dt));
+        let halo = Halo { factor: halo_factor(size, swing), lum: halo_lum(bass), reach: halo_reach(swing) };
         self.last = Some(halo);
         Some(halo)
     }
@@ -173,6 +186,12 @@ impl SoundHalo {
     /// the halo's own factor).
     pub fn factors(&self) -> &[f32] {
         &self.factors
+    }
+
+    /// Each solid's level of its own frequency band, 0..=1 (empty when off):
+    /// the values for `color_by = "sound"`.
+    pub fn colour_levels(&self) -> &[f32] {
+        &self.colour_levels
     }
 
     pub fn last(&self) -> Option<Halo> {

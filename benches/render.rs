@@ -6,7 +6,7 @@ use std::hint::black_box;
 
 use platomon::ascii::{self, Ramp};
 use platomon::aspect::Viewport;
-use platomon::color::{ColorBy, ColorDepth, ColorMap, Gradient};
+use platomon::color::{ColorBy, ColorMap, Gradient};
 use platomon::metrics::Channel;
 use platomon::overlay::{LegendParams, LegendPos, OverlayOptions, Overlays};
 use platomon::render::{QualityGovernor, RenderSettings, Renderer};
@@ -106,6 +106,7 @@ fn bench(c: &mut Criterion) {
         tag_labels: &[],
         tag_ink: platomon::color::NONE,
         tag_blocks: false,
+        tag_fixed: false,
     };
     c.bench_function("wqhd_640x240_overlays_wireframe_legend", |b| {
         b.iter(|| {
@@ -113,8 +114,9 @@ fn bench(c: &mut Criterion) {
             black_box(overlays.compose(&view, bw, bh, &big, &opt).chars.len())
         })
     });
-    // Colour: lum gradient composed to 24-bit escapes.
-    let cm = ColorMap { gradient: Gradient::parse("inferno").unwrap(), by: ColorBy::Lum, depth: ColorDepth::True };
+    // Colour: 16-colour lum palette composed to escapes.
+    let g = Gradient::parse("inferno").ok();
+    let cm = ColorMap::new(g.clone(), ColorBy::Lum, 16, g).unwrap();
     let levels = vec![0.5; 16];
     let copt = OverlayOptions { wireframe: false, legend: None, color: Some(&cm), levels: &levels, ..opt };
     let mut out = String::with_capacity(bw * bh * 8);
@@ -122,7 +124,7 @@ fn bench(c: &mut Criterion) {
         b.iter(|| {
             let view = r.view().unwrap();
             let cells = overlays.compose(&view, bw, bh, &big, &copt);
-            ascii::compose_terminal(cells.chars, cells.colors.map(|c| (c, cm.depth)), &vp, (bw, bh), None, &mut out);
+            ascii::compose_terminal(cells.chars, cells.colors, &vp, (bw, bh), None, &mut out);
             black_box(out.len())
         })
     });

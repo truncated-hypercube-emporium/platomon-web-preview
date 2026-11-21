@@ -3,7 +3,7 @@
 use std::fmt::Write as _;
 
 use crate::aspect::Viewport;
-use crate::color::{self, ColorDepth};
+use crate::color;
 
 /// Default ramp: 16 luminance levels, ordered by glyph ink coverage.
 pub const DEFAULT_RAMP: &str = " .,:;-~=+*ox#%&@";
@@ -41,6 +41,12 @@ impl Ramp {
         ((l * n as f32) as usize).min(n - 1)
     }
 
+    /// The glyph of bucket `i` (from [`Ramp::level`]).
+    #[inline(always)]
+    pub fn glyph_at(&self, i: usize) -> char {
+        self.chars[i]
+    }
+
     /// `lum` in 0..=1 → glyph.
     #[inline(always)]
     pub fn glyph(&self, lum: f32) -> char {
@@ -66,10 +72,48 @@ pub fn tone_map(radiance: f32, exposure: f32) -> f32 {
     (x / (1.0 + x)).powf(INV_GAMMA)
 }
 
+/// Entries in the gamma table over `s = √u`, `u = x / (1 + x)` in 0..=1:
+/// the curve is `s^(2/2.2)`, nearly straight, so linear steps fit it.
+const GAMMA_STEPS: usize = 4096;
+/// Below this `s` the curve bends too fast to interpolate: computed exactly.
+const GAMMA_EXACT_BELOW: f32 = 1.0 / 256.0;
+
+fn gamma_table() -> &'static [f32; GAMMA_STEPS + 2] {
+    static T: std::sync::OnceLock<[f32; GAMMA_STEPS + 2]> = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        let mut t = [0.0; GAMMA_STEPS + 2];
+        for (i, v) in t.iter_mut().enumerate() {
+            *v = ((i as f32 / GAMMA_STEPS as f32).min(1.0)).powf(2.0 * INV_GAMMA);
+        }
+        t
+    })
+}
+
+/// [`tone_map`] for a whole buffer, the gamma curve read from an
+/// interpolated table (within 2e-6 of `powf`, far below one glyph level
+/// of 1/32; exact near black).
+#[inline(always)]
+fn tone_map_lut(t: &[f32; GAMMA_STEPS + 2], radiance: f32, exposure: f32) -> f32 {
+    let x = (radiance * exposure).max(0.0);
+    if !x.is_finite() {
+        return if x.is_infinite() { 1.0 } else { 0.0 };
+    }
+    let u = x / (1.0 + x);
+    let s = u.sqrt();
+    if s < GAMMA_EXACT_BELOW {
+        return if u == 0.0 { 0.0 } else { u.powf(INV_GAMMA) };
+    }
+    let f = s * GAMMA_STEPS as f32;
+    let i = (f as usize).min(GAMMA_STEPS);
+    let a = t[i];
+    a + (t[i + 1] - a) * (f - i as f32)
+}
+
 /// Radiance buffer → display luminance 0..=1.
 pub fn tone_buffer(buf: &[f32], exposure: f32, out: &mut Vec<f32>) {
+    let t = gamma_table();
     out.clear();
-    out.extend(buf.iter().map(|&v| tone_map(v, exposure)));
+    out.extend(buf.iter().map(|&v| tone_map_lut(t, v, exposure)));
 }
 
 /// Display luminance → glyphs.
@@ -83,13 +127,13 @@ pub fn glyphs(buf: &[f32], ramp: &Ramp, exposure: f32) -> Vec<char> {
     buf.iter().map(|&v| ramp.glyph(tone_map(v, exposure))).collect()
 }
 
-/// Per-cell colours (`0xRRGGBB` or [`color::NONE`]) and the escape depth.
-pub type Colors<'a> = Option<(&'a [u32], ColorDepth)>;
+/// Per-cell palette colours (`0xRRGGBB` or [`color::NONE`]).
+pub type Colors<'a> = Option<&'a [u32]>;
 
 /// Push one row of glyphs, switching colour only where it changes. Leaves
 /// the default colour set.
-fn push_row(out: &mut String, cells: &[char], colors: Option<(&[u32], ColorDepth)>) {
-    let Some((cols, depth)) = colors else {
+fn push_row(out: &mut String, cells: &[char], colors: Option<&[u32]>) {
+    let Some(cols) = colors else {
         out.extend(cells);
         return;
     };
@@ -97,13 +141,13 @@ fn push_row(out: &mut String, cells: &[char], colors: Option<(&[u32], ColorDepth
     for (i, &c) in cells.iter().enumerate() {
         let col = cols.get(i).copied().unwrap_or(color::NONE);
         if col != cur && c != ' ' {
-            color::push_sgr(out, col, depth);
+            color::push_sgr(out, col);
             cur = col;
         }
         out.push(c);
     }
     if cur != color::NONE {
-        color::push_sgr(out, color::NONE, depth);
+        color::push_sgr(out, color::NONE);
     }
 }
 
@@ -116,7 +160,7 @@ pub fn compose_plain(cells: &[char], colors: Colors<'_>, w: usize, h: usize, out
         }
         let lo = (y * w).min(cells.len());
         let hi = ((y + 1) * w).min(cells.len());
-        let row_colors = colors.map(|(c, d)| (&c[lo.min(c.len())..hi.min(c.len())], d));
+        let row_colors = colors.map(|c| &c[lo.min(c.len())..hi.min(c.len())]);
         push_row(out, &cells[lo..hi], row_colors);
         out.extend(std::iter::repeat_n(' ', w - (hi - lo)));
     }
@@ -152,7 +196,7 @@ pub fn compose_terminal(
             let y = ty - vp.y;
             out.extend(std::iter::repeat_n(' ', vp.x));
             let row = y * w..(y + 1) * w;
-            push_row(out, &cells[row.clone()], colors.map(|(c, d)| (&c[row], d)));
+            push_row(out, &cells[row.clone()], colors.map(|c| &c[row]));
             out.extend(std::iter::repeat_n(' ', right));
         } else {
             out.extend(std::iter::repeat_n(' ', cols));
@@ -172,6 +216,17 @@ pub fn compose_terminal(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tone_table_matches_powf() {
+        let mut out = Vec::new();
+        let buf: Vec<f32> = (0..200_000).map(|k| (k as f32 * 1e-4).powi(2) * 0.05).chain([0.0, -1.0, f32::NAN, f32::INFINITY, 1e9]).collect();
+        tone_buffer(&buf, 1.3, &mut out);
+        for (&v, &l) in buf.iter().zip(&out) {
+            let exact = tone_map(v, 1.3);
+            assert!((l - exact).abs() < 2e-6 || (l.is_nan() && exact.is_nan()), "{v}: {l} vs {exact}");
+        }
+    }
 
     #[test]
     fn glyph_boundaries() {
@@ -273,10 +328,10 @@ mod tests {
         let cells = ['a', 'b', ' ', 'c'];
         let cols = [0xff0000, 0xff0000, 0x00ff00, color::NONE];
         let mut s = String::new();
-        compose_terminal(&cells, Some((&cols, ColorDepth::True)), &vp, (6, 1), None, &mut s);
+        compose_terminal(&cells, Some(&cols), &vp, (6, 1), None, &mut s);
         // one code for the red run, none for the blank (no visible ink), reset for 'c'
         assert_eq!(s, "\x1b[1;1H \x1b[38;2;255;0;0mab \x1b[39mc ");
-        compose_plain(&cells, Some((&cols, ColorDepth::Ansi256)), 4, 1, &mut s);
-        assert_eq!(s, "\x1b[38;5;196mab \x1b[39mc");
+        compose_plain(&cells, Some(&cols), 4, 1, &mut s);
+        assert_eq!(s, "\x1b[38;2;255;0;0mab \x1b[39mc");
     }
 }

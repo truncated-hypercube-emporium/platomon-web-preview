@@ -1,5 +1,6 @@
-//! Colour gradient mapping: glyph luminance or per-solid load → RGB, sent as
-//! 24-bit or 256-colour ANSI foreground codes.
+//! Colour mapping: a gradient sampled into a fixed palette of 16, 32, 64 or
+//! 128 colours, indexed per cell by brightness or by a per-solid value (load,
+//! spin, sound), with the background mapped on its own.
 
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
@@ -8,7 +9,7 @@ use std::str::FromStr;
 /// "No colour": the terminal's default foreground.
 pub const NONE: u32 = u32::MAX;
 
-/// What the gradient position comes from.
+/// What the solids' palette position comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ColorBy {
@@ -16,8 +17,34 @@ pub enum ColorBy {
     #[default]
     Lum,
     /// Each solid by its metric's load (idle → first stop, full → last
-    /// stop), shaded by brightness; background stays uncoloured.
+    /// stop), shaded by brightness.
     Load,
+    /// Each solid by its spin as seen from the camera: the middle of the
+    /// gradient is still (or edge-on), the first stop fast clockwise and the
+    /// last stop fast counter-clockwise; shaded by brightness.
+    Spin,
+    /// Each solid by the loudness of its own frequency band of the output
+    /// device (simplest solid = bass, most complex = treble); shaded by
+    /// brightness. Screensaver only.
+    Sound,
+}
+
+impl ColorBy {
+    pub const ALL: [ColorBy; 4] = [ColorBy::Lum, ColorBy::Load, ColorBy::Spin, ColorBy::Sound];
+
+    pub fn id(self) -> &'static str {
+        match self {
+            ColorBy::Lum => "lum",
+            ColorBy::Load => "load",
+            ColorBy::Spin => "spin",
+            ColorBy::Sound => "sound",
+        }
+    }
+
+    /// Whether solids are coloured by a per-solid value (not brightness).
+    pub fn per_solid(self) -> bool {
+        self != ColorBy::Lum
+    }
 }
 
 impl FromStr for ColorBy {
@@ -26,31 +53,111 @@ impl FromStr for ColorBy {
         match s.trim().to_ascii_lowercase().as_str() {
             "lum" | "luminance" | "brightness" => Ok(Self::Lum),
             "load" | "metric" => Ok(Self::Load),
-            _ => Err(format!("unknown colour source '{s}' (lum|load)")),
+            "spin" | "rotation" | "velocity" => Ok(Self::Spin),
+            "sound" | "music" | "audio" | "frequency" | "freq" => Ok(Self::Sound),
+            _ => Err(format!("unknown colour source '{s}' (lum|load|spin|sound)")),
         }
     }
 }
 
-/// Colour escape codes to emit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub enum ColorDepth {
-    /// 24-bit `ESC[38;2;R;G;Bm`.
-    #[default]
-    #[serde(rename = "24bit")]
-    True,
-    /// xterm 256-colour palette `ESC[38;5;Nm`, for older terminals.
-    #[serde(rename = "256")]
-    Ansi256,
+/// Palette sizes on offer.
+pub const PALETTE_SIZES: [usize; 4] = [16, 32, 64, 128];
+/// Default palette size.
+pub const DEFAULT_COLORS: usize = 16;
+
+/// The nearest offered palette size to `n`.
+pub fn palette_size(n: usize) -> usize {
+    PALETTE_SIZES.into_iter().min_by_key(|&s| s.abs_diff(n)).unwrap_or(DEFAULT_COLORS)
 }
 
-impl FromStr for ColorDepth {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, String> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "24bit" | "24" | "true" | "truecolor" => Ok(Self::True),
-            "256" | "8bit" => Ok(Self::Ansi256),
-            _ => Err(format!("unknown colour depth '{s}' (24bit|256)")),
+/// Background colouring: `auto` (by brightness with the solids' gradient
+/// when they are coloured by brightness, else uncoloured), `off`, `match`
+/// (the solids' gradient by brightness, whatever colours the solids) or a
+/// gradient of its own (preset or hex stops), by brightness.
+pub const BG_COLOR_DEFAULT: &str = "auto";
+
+/// The background's gradient for `spec` (see [`BG_COLOR_DEFAULT`]), given
+/// the solids' gradient and source; `None` = uncoloured.
+pub fn bg_gradient(spec: &str, solid: Option<&Gradient>, by: ColorBy) -> Result<Option<Gradient>, String> {
+    match spec.trim().to_ascii_lowercase().as_str() {
+        "" | "auto" => Ok(solid.filter(|_| by == ColorBy::Lum).cloned()),
+        "off" | "none" | "mono" => Ok(None),
+        "match" | "same" | "solids" => Ok(solid.cloned()),
+        _ => Gradient::parse(spec).map(Some).map_err(|e| format!("background colour: {e}")),
+    }
+}
+
+/// A fixed set of colours sampled from a gradient: `steps` positions along
+/// it × `shades` brightness levels (1 shade = full brightness only).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Palette {
+    colors: Vec<u32>,
+    steps: usize,
+    shades: usize,
+}
+
+/// Brightness of shade `s` of `shades` (the top shade is full brightness;
+/// never fully black, so the hue stays readable on dark faces).
+fn shade_level(s: usize, shades: usize) -> f32 {
+    0.35 + 0.65 * (s + 1) as f32 / shades as f32
+}
+
+impl Palette {
+    /// `n` colours along `g` at full brightness (colour by brightness).
+    pub fn ramp(g: &Gradient, n: usize) -> Self {
+        let n = n.max(2);
+        let colors = (0..n).map(|k| g.sample(k as f32 / (n - 1) as f32, 1.0)).collect();
+        Self { colors, steps: n, shades: 1 }
+    }
+
+    /// `n` colours: positions along `g` × brightness shades (colour by a
+    /// per-solid value, shaded by the glyph's brightness). 16 colours are 8
+    /// positions × 2 shades; larger palettes use 4 shades.
+    pub fn shaded(g: &Gradient, n: usize) -> Self {
+        let shades = if n <= 16 { 2 } else { 4 };
+        let steps = (n / shades).max(2);
+        let mut colors = Vec::with_capacity(steps * shades);
+        for v in 0..steps {
+            let t = v as f32 / (steps - 1) as f32;
+            colors.extend((0..shades).map(|s| g.sample(t, shade_level(s, shades))));
         }
+        Self { colors, steps, shades }
+    }
+
+    pub fn len(&self) -> usize {
+        self.colors.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.colors.is_empty()
+    }
+
+    pub fn colors(&self) -> &[u32] {
+        &self.colors
+    }
+
+    pub fn shades(&self) -> usize {
+        self.shades
+    }
+
+    /// Position index of `t` in 0..=1: step `k` covers `[k/n, (k+1)/n)`.
+    #[inline(always)]
+    fn step(&self, t: f32) -> usize {
+        let t = if t.is_finite() { t.clamp(0.0, 1.0) } else { 0.0 };
+        ((t * self.steps as f32) as usize).min(self.steps - 1)
+    }
+
+    /// The brightest colour at position `t`.
+    #[inline(always)]
+    pub fn at(&self, t: f32) -> u32 {
+        self.colors[self.step(t) * self.shades + self.shades - 1]
+    }
+
+    /// The shades (dark to bright) at position `t`.
+    #[inline(always)]
+    pub fn shade_row(&self, t: f32) -> &[u32] {
+        let i = self.step(t) * self.shades;
+        &self.colors[i..i + self.shades]
     }
 }
 
@@ -75,6 +182,8 @@ pub fn default_for(by: ColorBy) -> &'static str {
     match by {
         ColorBy::Lum => "inferno",
         ColorBy::Load => "traffic",
+        ColorBy::Spin => "plasma",
+        ColorBy::Sound => "viridis",
     }
 }
 
@@ -309,41 +418,68 @@ impl FromStr for TagColor {
     }
 }
 
-/// Nearest xterm-256 palette index (6×6×6 cube or 24-step grey ramp).
-pub fn ansi256(c: u32) -> u8 {
-    let (r, g, b) = (((c >> 16) & 0xff) as i32, ((c >> 8) & 0xff) as i32, (c & 0xff) as i32);
-    const LEVELS: [i32; 6] = [0, 95, 135, 175, 215, 255];
-    let q = |v: i32| LEVELS.iter().enumerate().min_by_key(|(_, l)| (v - **l).abs()).map_or(0, |(i, _)| i);
-    let (qr, qg, qb) = (q(r), q(g), q(b));
-    let cube = (LEVELS[qr], LEVELS[qg], LEVELS[qb]);
-    let grey_i = (((r + g + b) / 3 - 8).max(0) / 10).min(23);
-    let gv = 8 + grey_i * 10;
-    let d = |x: (i32, i32, i32)| (x.0 - r).pow(2) + (x.1 - g).pow(2) + (x.2 - b).pow(2);
-    if d((gv, gv, gv)) < d(cube) { 232 + grey_i as u8 } else { 16 + (36 * qr + 6 * qg + qb) as u8 }
-}
-
-/// Append the SGR code that sets the foreground to `c` ([`NONE`] = default).
-pub fn push_sgr(out: &mut String, c: u32, depth: ColorDepth) {
+/// Append the SGR code that sets the foreground to palette colour `c`
+/// ([`NONE`] = default).
+pub fn push_sgr(out: &mut String, c: u32) {
     if c == NONE {
         out.push_str("\x1b[39m");
         return;
     }
-    match depth {
-        ColorDepth::True => {
-            let _ = write!(out, "\x1b[38;2;{};{};{}m", (c >> 16) & 0xff, (c >> 8) & 0xff, c & 0xff);
-        }
-        ColorDepth::Ansi256 => {
-            let _ = write!(out, "\x1b[38;5;{}m", ansi256(c));
-        }
-    }
+    let _ = write!(out, "\x1b[38;2;{};{};{}m", (c >> 16) & 0xff, (c >> 8) & 0xff, c & 0xff);
 }
 
-/// Colouring for one run: gradient, source and output depth.
+/// Colouring for one run: the solids' palette and source, and the
+/// background's own palette. Every colour drawn is a palette entry.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ColorMap {
+    /// The solids' gradient (the background's when the solids are
+    /// uncoloured): tag colours are chosen from it.
     pub gradient: Gradient,
     pub by: ColorBy,
-    pub depth: ColorDepth,
+    /// Colours per palette (16, 32, 64 or 128).
+    pub size: usize,
+    /// The solids' palette; `None` = solids uncoloured.
+    pub solid: Option<Palette>,
+    /// The background's palette, by brightness; `None` = uncoloured.
+    pub bg: Option<Palette>,
+}
+
+impl ColorMap {
+    /// `None` when neither the solids nor the background are coloured.
+    pub fn new(solid: Option<Gradient>, by: ColorBy, size: usize, bg: Option<Gradient>) -> Option<Self> {
+        let size = palette_size(size);
+        let gradient = solid.clone().or_else(|| bg.clone())?;
+        let solid = solid.map(|g| if by.per_solid() { Palette::shaded(&g, size) } else { Palette::ramp(&g, size) });
+        let bg = bg.map(|g| Palette::ramp(&g, size));
+        Some(Self { gradient, by, size, solid, bg })
+    }
+
+    /// Colour of a solid cell: brightness `l` (0..=1) in glyph bucket
+    /// `bucket` of `buckets`, and the solid's value (per-solid sources).
+    #[inline]
+    pub fn solid_color(&self, value: Option<f32>, l: f32, bucket: usize, buckets: usize) -> u32 {
+        match (&self.solid, self.by.per_solid()) {
+            (None, _) => NONE,
+            (Some(p), false) => p.at(l),
+            (Some(p), true) => value.map_or(NONE, |v| p.shade_row(v)[bucket * p.shades() / buckets.max(1)]),
+        }
+    }
+
+    /// Colour of a background cell with brightness `l`.
+    #[inline]
+    pub fn bg_color(&self, l: f32) -> u32 {
+        self.bg.as_ref().map_or(NONE, |p| p.at(l))
+    }
+
+    /// A solid's legend/icon colour: its value's brightest shade, or the
+    /// palette's brightest colour when coloured by brightness.
+    pub fn icon_color(&self, value: Option<f32>) -> u32 {
+        match &self.solid {
+            None => NONE,
+            Some(p) if self.by.per_solid() => p.at(value.unwrap_or(0.0)),
+            Some(p) => p.at(1.0),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -408,24 +544,67 @@ mod tests {
     }
 
     #[test]
-    fn palette_256() {
-        assert_eq!(ansi256(0x000000), 16);
-        assert_eq!(ansi256(0xffffff), 231);
-        assert_eq!(ansi256(0xff0000), 196);
-        assert_eq!(ansi256(0x00ff00), 46);
-        assert_eq!(ansi256(0x808080), 244);
-        assert_eq!(ansi256(0x121212), 233);
+    fn palettes_hold_exactly_their_size_in_colours() {
+        let g = Gradient::parse("inferno").unwrap();
+        for n in PALETTE_SIZES {
+            let ramp = Palette::ramp(&g, n);
+            let shaded = Palette::shaded(&g, n);
+            assert_eq!((ramp.len(), shaded.len()), (n, n), "{n}");
+            assert_eq!(ramp.at(0.0), g.sample(0.0, 1.0));
+            assert_eq!(ramp.at(1.0), g.sample(1.0, 1.0));
+            // every lookup lands on a palette entry
+            let mut seen = std::collections::HashSet::new();
+            for k in 0..=1000 {
+                let t = k as f32 / 1000.0;
+                seen.insert(ramp.at(t));
+                for &c in shaded.shade_row(t) {
+                    assert!(shaded.colors().contains(&c));
+                }
+            }
+            assert_eq!(seen.len(), n, "{n}: every ramp colour is reachable");
+            // shades get brighter; the top shade is full brightness
+            let row = shaded.shade_row(0.9);
+            assert!(row.windows(2).all(|w| rel_luminance(w[0]) < rel_luminance(w[1])), "{n}: {row:x?}");
+            assert_eq!(*row.last().unwrap(), shaded.at(0.9));
+        }
+        assert_eq!(palette_size(24), 16);
+        assert_eq!(palette_size(100), 128);
+        assert_eq!(palette_size(16_000_000), 128);
+        assert_eq!(Palette::ramp(&g, 16).at(f32::NAN), g.sample(0.0, 1.0));
+    }
+
+    #[test]
+    fn background_maps_independently() {
+        let inferno = Gradient::parse("inferno").unwrap();
+        let ice = Gradient::parse("ice").unwrap();
+        assert_eq!(bg_gradient("auto", Some(&inferno), ColorBy::Lum).unwrap(), Some(inferno.clone()));
+        assert_eq!(bg_gradient("auto", Some(&inferno), ColorBy::Load).unwrap(), None);
+        assert_eq!(bg_gradient("match", Some(&inferno), ColorBy::Spin).unwrap(), Some(inferno.clone()));
+        assert_eq!(bg_gradient("off", Some(&inferno), ColorBy::Lum).unwrap(), None);
+        assert_eq!(bg_gradient("ice", None, ColorBy::Lum).unwrap(), Some(ice.clone()));
+        assert!(bg_gradient("plaid", None, ColorBy::Lum).is_err());
+        // background only: solids uncoloured, tags pick from the background's gradient
+        let m = ColorMap::new(None, ColorBy::Lum, 32, Some(ice.clone())).unwrap();
+        assert_eq!((m.solid.is_none(), m.gradient == ice), (true, true));
+        assert_eq!(m.solid_color(None, 0.5, 3, 16), NONE);
+        assert_eq!(m.bg_color(1.0), ice.sample(1.0, 1.0));
+        assert!(ColorMap::new(None, ColorBy::Lum, 16, None).is_none());
+        // per-solid sources shade by glyph bucket and need a value
+        let m = ColorMap::new(Some(inferno.clone()), ColorBy::Sound, 16, None).unwrap();
+        assert_eq!(m.solid_color(None, 0.5, 3, 16), NONE);
+        assert_eq!(m.solid_color(Some(1.0), 1.0, 15, 16), inferno.sample(1.0, 1.0));
+        assert_eq!(m.bg_color(0.5), NONE);
     }
 
     #[test]
     fn sgr_codes() {
         let mut s = String::new();
-        push_sgr(&mut s, 0x0a141e, ColorDepth::True);
-        push_sgr(&mut s, 0xff0000, ColorDepth::Ansi256);
-        push_sgr(&mut s, NONE, ColorDepth::True);
-        assert_eq!(s, "\x1b[38;2;10;20;30m\x1b[38;5;196m\x1b[39m");
-        assert_eq!("load".parse::<ColorBy>().unwrap(), ColorBy::Load);
-        assert_eq!("256".parse::<ColorDepth>().unwrap(), ColorDepth::Ansi256);
-        assert!("cmyk".parse::<ColorDepth>().is_err());
+        push_sgr(&mut s, 0x0a141e);
+        push_sgr(&mut s, NONE);
+        assert_eq!(s, "\x1b[38;2;10;20;30m\x1b[39m");
+        for by in ColorBy::ALL {
+            assert_eq!(by.id().parse::<ColorBy>().unwrap(), by);
+        }
+        assert!("cmyk".parse::<ColorBy>().is_err());
     }
 }

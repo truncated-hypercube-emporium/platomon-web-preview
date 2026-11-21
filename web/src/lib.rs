@@ -21,10 +21,10 @@ use glam::Vec2;
 use platomon::ascii::Ramp;
 use platomon::aspect::{self, AspectMode, Viewport};
 use platomon::clock::{activity_to_fps, slew_limit};
-use platomon::color::{self, ColorDepth, ColorMap};
+use platomon::color::{self, ColorBy, ColorMap};
 use platomon::config::{Config, SlotSpec};
 use platomon::metrics::{MetricsState, activity_score};
-use platomon::overlay::{Halo, OverlayOptions, Overlays};
+use platomon::overlay::{HALO_SWINGS, Halo, OverlayOptions, Overlays};
 use platomon::render::{QualityGovernor, RenderSettings, Renderer, TraceSettings};
 use platomon::scene::camera::CameraParams;
 use platomon::scene::{AnimParams, Ground, Scene, SlotLayout};
@@ -139,28 +139,8 @@ fn camera_params(c: &Config) -> CameraParams {
         seed: c.seed,
         focus_zoom: c.focus_zoom,
         focus_tau: c.focus_tau,
+        auto_distance: c.auto_distance,
     }
-}
-
-/// What the page should paint for `c`: the colour itself, or for 256-colour
-/// output the xterm palette entry the terminal would show.
-fn display_color(c: u32, depth: ColorDepth) -> u32 {
-    if c == color::NONE || depth == ColorDepth::True {
-        return c;
-    }
-    xterm256_rgb(color::ansi256(c))
-}
-
-/// RGB of an xterm-256 palette index (16..=255; lower ones are not produced).
-fn xterm256_rgb(i: u8) -> u32 {
-    let i = i as u32;
-    if i >= 232 {
-        let v = 8 + (i - 232) * 10;
-        return (v << 16) | (v << 8) | v;
-    }
-    const LEVELS: [u32; 6] = [0, 95, 135, 175, 215, 255];
-    let k = i.saturating_sub(16);
-    (LEVELS[(k / 36) as usize % 6] << 16) | (LEVELS[(k / 6) as usize % 6] << 8) | LEVELS[(k % 6) as usize]
 }
 
 /// Parse, sanitise and validate a config.
@@ -245,8 +225,11 @@ impl App {
         c.tag_blocks = new.tag_blocks;
         c.color = new.color.clone();
         c.color_by = new.color_by;
-        c.color_depth = new.color_depth;
         c.color_reverse = new.color_reverse;
+        c.colors = new.colors;
+        c.bg_color = new.bg_color.clone();
+        c.tag_fixed_len = new.tag_fixed_len;
+        c.far_ground = new.far_ground;
         self.cmap = c.color_map().ok().flatten();
         c.min_scale = new.min_scale;
         c.max_scale = new.max_scale;
@@ -278,8 +261,8 @@ impl App {
     }
 
     /// Sound halo settings (see [`set_sound`]).
-    pub fn set_sound(&mut self, source: Source, wide: bool, bands: bool) {
-        self.sound.configure(source, wide, bands, &self.scene);
+    pub fn set_sound(&mut self, source: Source, swing: f32, bands: bool) {
+        self.sound.configure(source, swing, bands, &self.scene);
     }
 
     pub fn sound(&self) -> &SoundHalo {
@@ -315,14 +298,28 @@ impl App {
         let want = activity_to_fps(a, self.cfg.fps_min, self.cfg.fps_max, self.cfg.fps_curve);
         self.target = slew_limit(self.target, want, self.cfg.fps_slew, dt).clamp(self.cfg.fps_min, self.cfg.fps_max);
         self.scene.update(&channels, &self.anim, dt);
-        self.levels.clear();
-        self.levels.extend(channels.iter().map(|c| if c.available { c.level } else { 0.0 }));
+        // Sound first: its per-solid bands are the colour values for
+        // `color_by = "sound"`.
+        let halo = self.sound.next((dt - std::mem::take(&mut self.halo_time)).max(0.0));
+        if self.cfg.color_by == ColorBy::Sound {
+            self.levels.clear();
+            self.levels.extend_from_slice(self.sound.colour_levels());
+            self.levels.resize(self.scene.solids.len(), 0.0);
+        } else {
+            self.scene.color_values(self.cfg.color_by, &channels, &mut self.levels);
+        }
 
         let area_h = rows.saturating_sub(self.cfg.show_stats as usize);
         let vp = aspect::viewport(cols, area_h, self.ratio, self.cfg.aspect_mode, self.cfg.char_aspect);
         let base = RenderSettings {
             spp: self.cfg.spp,
-            trace: TraceSettings { bounces: self.cfg.bounces, max_steps: self.cfg.max_steps, max_dist: self.cfg.max_dist },
+            trace: TraceSettings {
+                bounces: self.cfg.bounces,
+                max_steps: self.cfg.max_steps,
+                max_dist: self.cfg.max_dist,
+                ..TraceSettings::default()
+            }
+            .with_far_ground(self.cfg.far_ground),
             char_aspect: self.cfg.char_aspect,
             fit_aspect: self.ratio,
         };
@@ -342,7 +339,6 @@ impl App {
             self.tag_labels.clear();
             self.tag_labels.extend(readings.iter().map(|r| ui::short_label(r)));
         }
-        let halo = self.sound.next((dt - std::mem::take(&mut self.halo_time)).max(0.0));
         let ramp = Ramp::new(&self.cfg.ramp);
         let legend = self.cfg.legend_params();
         let opt = OverlayOptions {
@@ -360,14 +356,15 @@ impl App {
             tag_labels: &self.tag_labels,
             tag_ink: self.cfg.tag_ink(self.cmap.as_ref()),
             tag_blocks: self.cfg.tag_blocks,
+            tag_fixed: self.cfg.tag_fixed_len,
         };
         self.pic_chars.clear();
         self.pic_colors.clear();
         if let Some(view) = self.renderer.view() {
             let cells = self.overlays.compose(&view, vp.w, vp.h, &self.scene, &opt);
             self.pic_chars.extend_from_slice(cells.chars);
-            if let (Some(c), Some(m)) = (cells.colors, self.cmap.as_ref()) {
-                self.pic_colors.extend(c.iter().map(|&c| display_color(c, m.depth)));
+            if let Some(c) = cells.colors {
+                self.pic_colors.extend_from_slice(c);
             }
         }
 
@@ -421,6 +418,7 @@ impl App {
             tag_labels: &self.tag_labels,
             tag_ink: self.cfg.tag_ink(self.cmap.as_ref()),
             tag_blocks: self.cfg.tag_blocks,
+            tag_fixed: self.cfg.tag_fixed_len,
         };
         let view = self.renderer.view()?;
         let vp = last.vp;
@@ -431,8 +429,8 @@ impl App {
         self.pic_chars.clear();
         self.pic_chars.extend_from_slice(u.chars);
         self.pic_colors.clear();
-        if let (Some(c), Some(m)) = (u.colors, self.cmap.as_ref()) {
-            self.pic_colors.extend(c.iter().map(|&c| display_color(c, m.depth)));
+        if let Some(c) = u.colors {
+            self.pic_colors.extend_from_slice(c);
         }
         assemble(
             &mut self.text,
@@ -481,8 +479,8 @@ struct Host {
     colors: Vec<u32>,
     message: Vec<u8>,
     sim: Sim,
-    /// Sound settings, kept across restarts: source, wide swing, bands.
-    sound: (Source, bool, bool),
+    /// Sound settings, kept across restarts: source, halo swing, bands.
+    sound: (Source, f32, bool),
     /// Samples written by the page (see [`audio_buffer`]).
     audio: Vec<f32>,
 }
@@ -555,12 +553,13 @@ pub extern "C" fn set_sim(profile: u32, speed: f64, manual: f64, seed: u32) {
 }
 
 /// Sound halo: `source` 0 = off, 1 = simulated music, 2 = samples from the
-/// page ([`audio_push`]); `wide` 1 = size swing ±30% instead of ±5%;
+/// page ([`audio_push`]); `swing` 0/1/2 = halo size swing ±10/30/60% of the radius;
 /// `bands` 1 = each solid follows its own frequency band, 0 = overall level.
 #[unsafe(no_mangle)]
-pub extern "C" fn set_sound(source: u32, wide: u32, bands: u32) {
+pub extern "C" fn set_sound(source: u32, swing: u32, bands: u32) {
     HOST.with_borrow_mut(|h| {
-        h.sound = (Source::from_index(source), wide != 0, bands != 0);
+        let swing = HALO_SWINGS[(swing as usize).min(HALO_SWINGS.len() - 1)];
+        h.sound = (Source::from_index(source), swing, bands != 0);
         if let Some(app) = h.app.as_mut() {
             app.set_sound(h.sound.0, h.sound.1, h.sound.2);
         }
@@ -779,10 +778,10 @@ mod tests {
     #[test]
     fn sound_halo_draws_and_halo_frames_redraw_it() {
         let mut a = app("show_stats = true\nlegend = true\n");
-        a.set_sound(Source::Off, false, true);
+        a.set_sound(Source::Off, HALO_SWINGS[0], true);
         let quiet = a.frame(0.1, 100, 30, 10.0, 0.01).to_string();
         assert!(a.halo_frame(0.016).is_none(), "halo off: nothing to redraw");
-        a.set_sound(Source::Sim, true, true);
+        a.set_sound(Source::Sim, HALO_SWINGS[1], true);
         let mut changed = 0;
         let mut sizes = Vec::new();
         for i in 0..40 {
@@ -805,14 +804,14 @@ mod tests {
         assert!(changed > 0, "halo-only frames repaint");
         assert_ne!(a.frame(0.1, 100, 30, 10.0, 0.01), quiet, "halo visible");
         let (lo, hi) = sizes.iter().fold((f32::MAX, f32::MIN), |(l, h), &v| (l.min(v), h.max(v)));
-        assert!(lo >= 0.9 && hi <= 1.5 && hi > lo, "wide swing range {lo}..{hi}");
+        assert!(lo >= 0.9 && hi <= 1.5 && hi > lo, "±30% swing range {lo}..{hi}");
         assert_eq!(a.sound().factors().len(), 5, "one size per solid by frequency");
     }
 
     #[test]
     fn host_samples_drive_the_halo() {
         let mut a = app("");
-        a.set_sound(Source::Host, false, false);
+        a.set_sound(Source::Host, HALO_SWINGS[0], false);
         let rate = 48_000.0;
         let tone: Vec<f32> = (0..4096).map(|i| 0.8 * (std::f32::consts::TAU * 60.0 * i as f32 / rate).sin()).collect();
         for _ in 0..20 {
@@ -826,14 +825,40 @@ mod tests {
     }
 
     #[test]
+    fn v14_colour_cameras_and_floor() {
+        // Sound colouring follows each solid's own band of the simulated track.
+        let mut a = app("color = \"viridis\"\ncolor_by = \"sound\"\ncolors = 64\nshow_stats = true\n");
+        a.set_sound(Source::Sim, HALO_SWINGS[2], true);
+        for _ in 0..10 {
+            let t = a.frame(0.1, 80, 24, 10.0, 0.01).to_string();
+            assert_eq!(a.colors().len(), t.chars().count());
+        }
+        assert_eq!(a.levels.len(), 5);
+        assert!(a.levels.iter().any(|&l| l > 0.0), "{:?}", a.levels);
+        assert_eq!(a.cmap.as_ref().map(|m| m.size), Some(64));
+        // Tilt / resonance cameras with auto distance, the extended floor and a
+        // background gradient of its own.
+        for cam in ["tilt", "resonance"] {
+            let toml = format!("camera = \"{cam}\"\nauto_distance = true\nfar_ground = true\nbg_color = \"ice\"\ntags = true\ntag_fixed_len = true\n");
+            let mut b = app(&toml);
+            for _ in 0..5 {
+                assert_eq!(b.frame(0.2, 80, 24, 10.0, 0.01).lines().count(), 24, "{cam}");
+            }
+            assert!(!b.colors().is_empty(), "background coloured on its own");
+        }
+        assert!(load("bg_color = \"plaid\"").is_err());
+        assert!(load("color_depth = \"256\"").is_ok(), "old key ignored");
+    }
+
+    #[test]
     fn tags_and_quasicrystal_render() {
         let mut a = app("tags = true\ntag_blocks = false\nshow_stats = true\nbg_pattern = \"quasicrystal\"\nbg_waves = 9\n");
         let plain = {
             let mut b = app("show_stats = true\nbg_pattern = \"quasicrystal\"\nbg_waves = 9\n");
-            b.set_sound(Source::Off, false, true);
+            b.set_sound(Source::Off, HALO_SWINGS[0], true);
             b.frame(0.1, 120, 40, 10.0, 0.01).to_string()
         };
-        a.set_sound(Source::Off, false, true);
+        a.set_sound(Source::Off, HALO_SWINGS[0], true);
         let t = a.frame(0.1, 120, 40, 10.0, 0.01).to_string();
         assert_eq!(t.split('\n').count(), 40);
         assert!(t.lines().take(39).any(|l| l.contains("CPU")), "a tag names its metric");
@@ -845,13 +870,4 @@ mod tests {
         assert!(!a.colors().is_empty());
     }
 
-    #[test]
-    fn palette_256_rgb() {
-        assert_eq!(xterm256_rgb(16), 0x000000);
-        assert_eq!(xterm256_rgb(231), 0xffffff);
-        assert_eq!(xterm256_rgb(196), 0xff0000);
-        assert_eq!(xterm256_rgb(244), 0x808080);
-        assert_eq!(display_color(0xff0101, ColorDepth::Ansi256), 0xff0000);
-        assert_eq!(display_color(0xff0101, ColorDepth::True), 0xff0101);
-    }
 }
