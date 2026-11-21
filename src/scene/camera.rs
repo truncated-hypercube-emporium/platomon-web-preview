@@ -256,6 +256,23 @@ impl CameraRig {
         self.radius.hypot(self.height - TARGET_Y).max(1e-3)
     }
 
+    /// The furthest the eye ever gets from the look-at point, in any mode,
+    /// with dynamic distance at its widest. Focus mode's eye stays between
+    /// the overview eye and a solid, so the overview bounds it too.
+    pub fn reach(&self) -> f32 {
+        let d = match self.mode {
+            CameraMode::Orbit => self.radius.hypot(self.height + self.bob.abs() - TARGET_Y),
+            CameraMode::Resonance => self.overview_distance() * (1.0 + RESONANCE_BREATH),
+            _ => self.overview_distance(),
+        };
+        if self.auto_distance { d * ZOOM_MAX } else { d }
+    }
+
+    /// The point the overview, tilt and resonance cameras look at.
+    pub fn target(&self) -> Vec3A {
+        self.centroid + Vec3A::new(0.0, TARGET_Y, 0.0)
+    }
+
     /// Tilt mode: one cycle of arc up, hold, arc down, hold.
     fn arc_cycle(&self) -> f32 {
         3.0 * self.arc_secs

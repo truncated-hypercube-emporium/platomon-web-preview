@@ -74,6 +74,25 @@ pub struct Light {
     pub emission: f32,
 }
 
+/// Where the light sits relative to the centroid, per unit of layout scale,
+/// and its radius (tuned on the default 5-solid ring).
+const LIGHT_OFFSET: Vec3A = Vec3A::new(-7.0, 11.0, 4.0);
+const LIGHT_RADIUS: f32 = 2.2;
+/// The light's near surface stays at least this many times the camera's
+/// furthest reach from the centroid.
+const LIGHT_CLEARANCE: f32 = 1.2;
+
+/// The scene light, pushed out along its usual direction until no camera
+/// position can reach or look through it. Its radius grows by the same
+/// factor, so it covers the same angle from the solids and lights them as
+/// before (irradiance depends only on that angle, not on the distance).
+fn light_beyond(centroid: Vec3A, k: f32, rig: &CameraRig) -> Light {
+    let (d, r) = (LIGHT_OFFSET.length() * k, LIGHT_RADIUS * k);
+    let reach = rig.reach() + (rig.target() - centroid).length();
+    let push = (LIGHT_CLEARANCE * reach / (d - r)).max(1.0);
+    Light { center: centroid + LIGHT_OFFSET * (k * push), radius: r * push, emission: 90.0 }
+}
+
 /// Animation ranges from the config.
 #[derive(Debug, Clone, Copy)]
 pub struct AnimParams {
@@ -336,6 +355,7 @@ impl Scene {
         // so the camera framing tuned for rings needs to back off for shells.
         let frame_extent = if layout == Layout::Sphere { extent * SPHERE_FRAMING } else { extent };
         let rig = CameraRig::new(cam, centroid, frame_extent);
+        let light = light_beyond(centroid, k, &rig);
         let span = (anim.max_spin - anim.idle_spin).max(0.0);
         let spin_max = (anim.idle_spin + span).hypot(0.5 * anim.idle_spin + span).max(1e-3);
         let mut s = Self {
@@ -349,11 +369,7 @@ impl Scene {
             extent,
             camera: rig.camera(),
             rig,
-            light: Light {
-                center: centroid + Vec3A::new(-7.0, 11.0, 4.0) * k,
-                radius: 2.2 * k,
-                emission: 90.0,
-            },
+            light,
             sky: 0.12,
             background: 0.0,
             // Rotation centre: the focal point the camera looks at, on the ground.
@@ -689,6 +705,49 @@ mod tests {
         assert!(big.extent > small.extent);
         assert!((big.camera.pos - big.centroid).length() > (small.camera.pos - small.centroid).length());
         assert!(big.light.radius > small.light.radius);
+    }
+
+    /// The camera, wherever any mode takes it, never reaches the light or
+    /// looks through it at a solid, and the light still covers the angle
+    /// it was tuned to from the solids (same shading).
+    #[test]
+    fn camera_never_reaches_or_looks_through_the_light() {
+        use crate::scene::camera::CameraMode;
+        let anim = AnimParams::default();
+        let tuned = (LIGHT_RADIUS / LIGHT_OFFSET.length()).asin();
+        for (n, layout) in [(5usize, Layout::Rings), (16, Layout::Rings), (16, Layout::Sphere)] {
+            let slots: Vec<SlotLayout> =
+                (0..n).map(|i| SlotLayout { solid: SolidKind::ALL[i % SolidKind::ALL.len()], ring: None }).collect();
+            for mode in CameraMode::ALL {
+                for auto_distance in [false, true] {
+                    let cp = CameraParams { mode, auto_distance, period: 8.0, seed: Some(3), ..CameraParams::default() };
+                    let mut s = Scene::with_layout(&slots, &anim, &cp, layout);
+                    let l = s.light;
+                    let seen = ((l.center - s.centroid).length().recip() * l.radius).asin();
+                    assert!((seen - tuned).abs() < 1e-4, "same apparent size from the solids");
+                    for step in 0..400 {
+                        let t = step as f32 * 0.25;
+                        let ch: Vec<Channel> = (0..n)
+                            .map(|i| {
+                                let v = 0.5 + 0.5 * (0.7 * t + i as f32).sin();
+                                Channel { available: true, level: v, spin_y: v, spin_x: 0.2, activity: v }
+                            })
+                            .collect();
+                        s.update(&ch, &anim, 0.25);
+                        let eye = s.camera.pos;
+                        let what = format!("{n} {layout:?} {mode:?} auto={auto_distance} t={t}");
+                        assert!((eye - l.center).length() > l.radius * 1.1, "{what}: camera at the light");
+                        for inst in &s.solids {
+                            // segment eye -> solid centre must miss the light sphere
+                            let seg = inst.center - eye;
+                            let u = ((l.center - eye).dot(seg) / seg.length_squared()).clamp(0.0, 1.0);
+                            let gap = (eye + seg * u - l.center).length();
+                            assert!(gap > l.radius, "{what}: light in front of a solid");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
