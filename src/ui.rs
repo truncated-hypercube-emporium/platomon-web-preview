@@ -12,6 +12,7 @@ pub enum Action {
     ToggleStats,
     ToggleLegend,
     ToggleWireframe,
+    ToggleTags,
     Resize(u16, u16),
 }
 
@@ -29,6 +30,7 @@ pub fn map_event(ev: &Event) -> Action {
                 KeyCode::Char('s') | KeyCode::Char('S') if *kind == KeyEventKind::Press => Action::ToggleStats,
                 KeyCode::Char('l') | KeyCode::Char('L') if *kind == KeyEventKind::Press => Action::ToggleLegend,
                 KeyCode::Char('w') | KeyCode::Char('W') if *kind == KeyEventKind::Press => Action::ToggleWireframe,
+                KeyCode::Char('t') | KeyCode::Char('T') if *kind == KeyEventKind::Press => Action::ToggleTags,
                 _ => Action::None,
             }
         }
@@ -134,6 +136,7 @@ mod tests {
         assert_eq!(map_event(&Event::Resize(80, 24)), Action::Resize(80, 24));
         assert_eq!(map_event(&key(KeyCode::Char('l'), KeyModifiers::NONE, p)), Action::ToggleLegend);
         assert_eq!(map_event(&key(KeyCode::Char('W'), KeyModifiers::SHIFT, p)), Action::ToggleWireframe);
+        assert_eq!(map_event(&key(KeyCode::Char('t'), KeyModifiers::NONE, p)), Action::ToggleTags);
     }
 
     #[test]

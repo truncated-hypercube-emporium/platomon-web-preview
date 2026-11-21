@@ -38,11 +38,23 @@ pub enum Pattern {
     Hex,
     /// Polar checkerboard: rings × 12 sectors around the focal point.
     Radial,
+    /// Quasicrystal: N plane waves at evenly spaced angles, summed and folded
+    /// into bands; a quasiperiodic (never repeating) tiling that flows as the
+    /// waves' phase advances.
+    Quasicrystal,
 }
 
 impl Pattern {
-    pub const ALL: [Pattern; 7] =
-        [Pattern::Solid, Pattern::Checker, Pattern::Diamond, Pattern::Brick, Pattern::Triangles, Pattern::Hex, Pattern::Radial];
+    pub const ALL: [Pattern; 8] = [
+        Pattern::Solid,
+        Pattern::Checker,
+        Pattern::Diamond,
+        Pattern::Brick,
+        Pattern::Triangles,
+        Pattern::Hex,
+        Pattern::Radial,
+        Pattern::Quasicrystal,
+    ];
 
     pub fn id(self) -> &'static str {
         match self {
@@ -53,6 +65,7 @@ impl Pattern {
             Pattern::Triangles => "triangles",
             Pattern::Hex => "hex",
             Pattern::Radial => "radial",
+            Pattern::Quasicrystal => "quasicrystal",
         }
     }
 
@@ -65,6 +78,7 @@ impl Pattern {
             Pattern::Triangles => "squares split on the diagonal, alternating",
             Pattern::Hex => "hexagonal tiles, three tones",
             Pattern::Radial => "polar checkerboard: rings x 12 sectors around the focal point",
+            Pattern::Quasicrystal => "quasicrystal: interfering plane waves, animated (--bg-waves, --bg-wave-speed)",
         }
     }
 }
@@ -128,7 +142,18 @@ pub struct GroundParams {
     pub rotate: Spin,
     /// Seconds per revolution about the focal point.
     pub rotate_period: f32,
+    /// Quasicrystal: number of plane waves (the pattern's rotational
+    /// symmetry; 5 or 7 look classic), [`WAVES_MIN`]..=[`WAVES_MAX`].
+    pub waves: u32,
+    /// Quasicrystal: phase speed, radians per second (0 = still).
+    pub wave_speed: f32,
 }
+
+/// Quasicrystal wave count range and defaults.
+pub const WAVES_MIN: u32 = 3;
+pub const WAVES_MAX: u32 = 24;
+pub const WAVES_DEFAULT: u32 = 7;
+pub const WAVE_SPEED_DEFAULT: f32 = 0.6;
 
 impl Default for GroundParams {
     fn default() -> Self {
@@ -142,6 +167,8 @@ impl Default for GroundParams {
             sway_period: 10.0,
             rotate: Spin::Off,
             rotate_period: 60.0,
+            waves: WAVES_DEFAULT,
+            wave_speed: WAVE_SPEED_DEFAULT,
         }
     }
 }
@@ -172,6 +199,18 @@ pub struct Ground {
     /// Accumulated scroll, world units.
     travelled: Vec2,
     angle: f32,
+    /// Per-frame constants for [`Ground::pattern_coords`], refreshed by
+    /// [`Ground::advance`] instead of recomputed for every pixel: sine and
+    /// cosine of `-angle`, and the current [`Ground::offset`].
+    frame_sin: f32,
+    frame_cos: f32,
+    frame_offset: Vec2,
+    /// Quasicrystal lookup table: the waves' unit directions (first
+    /// `n_waves`), their phase speed and this frame's phase.
+    wave_dirs: [Vec2; WAVES_MAX as usize],
+    n_waves: usize,
+    wave_speed: f32,
+    frame_phase: f32,
 }
 
 impl Ground {
@@ -181,7 +220,7 @@ impl Ground {
             Spin::Ccw => TAU / p.rotate_period.max(0.1),
             Spin::Cw => -TAU / p.rotate_period.max(0.1),
         };
-        Self {
+        let mut g = Self {
             enabled: p.lum > 0.0,
             base: albedo_for_lum(p.lum),
             contrast: p.contrast.clamp(0.0, 1.0),
@@ -195,7 +234,23 @@ impl Ground {
             time: 0.0,
             travelled: Vec2::ZERO,
             angle: 0.0,
-        }
+            frame_sin: 0.0,
+            frame_cos: 1.0,
+            frame_offset: Vec2::ZERO,
+            wave_dirs: [Vec2::ZERO; WAVES_MAX as usize],
+            n_waves: 0,
+            wave_speed: if p.wave_speed.is_finite() { p.wave_speed } else { WAVE_SPEED_DEFAULT },
+            frame_phase: 0.0,
+        };
+        g.n_waves = wave_dirs(p.waves, &mut g.wave_dirs);
+        g.refresh_frame();
+        g
+    }
+
+    fn refresh_frame(&mut self) {
+        (self.frame_sin, self.frame_cos) = (-self.angle).sin_cos();
+        self.frame_offset = self.offset();
+        self.frame_phase = (self.wave_speed * self.time).rem_euclid(TAU);
     }
 
     pub fn mean_albedo(&self) -> f32 {
@@ -211,6 +266,7 @@ impl Ground {
         self.time += dt;
         self.travelled += self.scroll * dt;
         self.angle = (self.angle + self.rot_rate * dt).rem_euclid(TAU);
+        self.refresh_frame();
     }
 
     /// Current translation of the pattern (scroll + sway), world units.
@@ -222,9 +278,12 @@ impl Ground {
 
     /// Pattern-space coordinates (tile units) of a world point on the ground.
     /// The pattern is rotated by `angle` about the pivot, then translated.
+    #[inline]
     pub fn pattern_coords(&self, x: f32, z: f32) -> Vec2 {
-        let d = rotate_xz(Vec2::new(x, z) - self.pivot, -self.angle);
-        (d - self.offset()) * self.inv_scale
+        let v = Vec2::new(x, z) - self.pivot;
+        let (s, c) = (self.frame_sin, self.frame_cos);
+        let d = Vec2::new(v.x * c + v.y * s, v.y * c - v.x * s);
+        (d - self.frame_offset) * self.inv_scale
     }
 
     /// Albedo at ground point `p`, hit at distance `t` (for anti-alias fading).
@@ -238,8 +297,53 @@ impl Ground {
             return self.base;
         }
         let uv = self.pattern_coords(p.x, p.z);
-        (self.base * (1.0 + self.contrast * fade * tone(self.pattern, uv))).clamp(0.0, 0.95)
+        let k = if self.pattern == Pattern::Quasicrystal {
+            quasicrystal(uv, &self.wave_dirs[..self.n_waves], self.frame_phase)
+        } else {
+            tone(self.pattern, uv)
+        };
+        (self.base * (1.0 + self.contrast * fade * k)).clamp(0.0, 0.95)
     }
+}
+
+/// Fill `out` with the unit directions of `n` plane waves at angles
+/// `k·π/n` (clamped to the wave range); returns how many.
+fn wave_dirs(n: u32, out: &mut [Vec2; WAVES_MAX as usize]) -> usize {
+    let n = n.clamp(WAVES_MIN, WAVES_MAX) as usize;
+    for (k, d) in out.iter_mut().take(n).enumerate() {
+        let a = std::f32::consts::PI * k as f32 / n as f32;
+        *d = Vec2::new(a.cos(), a.sin());
+    }
+    n
+}
+
+/// Entries in [`cos_turns`]'s table (one full turn).
+const COS_LUT: usize = 1024;
+
+/// `cos(2π·x)` from a lookup table with linear interpolation (error below
+/// 1e-5), several times cheaper than `f32::cos` in the quasicrystal's
+/// per-pixel wave sum.
+#[inline(always)]
+fn cos_turns(x: f32) -> f32 {
+    static T: std::sync::OnceLock<Box<[f32]>> = std::sync::OnceLock::new();
+    let t = T.get_or_init(|| (0..=COS_LUT).map(|k| (TAU * k as f32 / COS_LUT as f32).cos()).collect());
+    let f = (x - x.floor()) * COS_LUT as f32;
+    let i = (f as usize).min(COS_LUT - 1);
+    let w = f - i as f32;
+    t[i] + (t[i + 1] - t[i]) * w
+}
+
+/// Quasicrystal tone in −1..=1 at `uv` (tile units): the plane waves `dirs`
+/// (one wavelength per tile) at `phase`, each mapped to 0..=1 and summed,
+/// then folded back and forth into 0..=1 bands so the interference shows as
+/// sharp, many-fold symmetric rosettes.
+#[inline]
+pub fn quasicrystal(uv: Vec2, dirs: &[Vec2], phase: f32) -> f32 {
+    let s: f32 = dirs.iter().map(|d| 0.5 + 0.5 * cos_turns(uv.dot(*d) + phase / TAU)).sum();
+    let k = s.floor();
+    let f = s - k;
+    let v = if (k as i64) & 1 == 1 { 1.0 - f } else { f };
+    2.0 * v - 1.0
 }
 
 #[inline(always)]
@@ -292,6 +396,11 @@ pub fn tone(pattern: Pattern, uv: Vec2) -> f32 {
             let sector = (v.atan2(u) / TAU * 12.0).floor();
             parity(r.floor() + sector)
         }
+        Pattern::Quasicrystal => {
+            let mut dirs = [Vec2::ZERO; WAVES_MAX as usize];
+            let n = wave_dirs(WAVES_DEFAULT, &mut dirs);
+            quasicrystal(uv, &dirs[..n], 0.0)
+        }
     }
 }
 
@@ -336,7 +445,8 @@ mod tests {
             for i in 0..40 {
                 for j in 0..40 {
                     let uv = Vec2::new(i as f32 * 0.37 - 7.0, j as f32 * 0.41 - 8.0);
-                    seen.insert(tone(p, uv) as i32);
+                    // tiled patterns give exact tones; the quasicrystal shades smoothly
+                    seen.insert(tone(p, uv).round() as i32);
                 }
             }
             assert!(seen.contains(&-1) && seen.contains(&1), "{p:?}: {seen:?}");
@@ -379,6 +489,47 @@ mod tests {
         assert!((ccw.pattern_coords(pivot.x, pivot.y)).length() < 1e-5);
         let off = Ground::new(&p(Spin::Off), pivot);
         assert_eq!(off.angle(), 0.0);
+    }
+
+    #[test]
+    fn quasicrystal_is_symmetric_bounded_and_flows() {
+        for n in [5u32, 7, 12] {
+            let mut dirs = [Vec2::ZERO; WAVES_MAX as usize];
+            let k = wave_dirs(n, &mut dirs);
+            assert_eq!(k, n as usize);
+            let d = &dirs[..k];
+            let mut seen = (f32::MAX, f32::MIN);
+            for i in 0..400 {
+                let uv = Vec2::new((i % 20) as f32 * 0.137 - 1.3, (i / 20) as f32 * 0.171 - 1.7);
+                let v = quasicrystal(uv, d, 0.0);
+                assert!((-1.0..=1.0).contains(&v), "{n}: {v}");
+                seen = (seen.0.min(v), seen.1.max(v));
+                // n-fold symmetric: turning by π/n maps the waves onto themselves
+                let turned = rotate_xz(uv, std::f32::consts::PI / n as f32);
+                assert!((quasicrystal(turned, d, 0.0) - v).abs() < 2e-3, "{n}-fold symmetry at {uv:?}");
+            }
+            assert!(seen.0 < -0.9 && seen.1 > 0.9, "{n}: full tone range {seen:?}");
+        }
+        // wave counts are clamped
+        let mut dirs = [Vec2::ZERO; WAVES_MAX as usize];
+        assert_eq!(wave_dirs(1, &mut dirs), WAVES_MIN as usize);
+        assert_eq!(wave_dirs(99, &mut dirs), WAVES_MAX as usize);
+        // it flows over time; the tiled patterns stay put
+        let p = |pattern| GroundParams { pattern, contrast: 1.0, scale: 1.0, ..Default::default() };
+        let pt = Vec3A::new(0.37, 0.0, -0.61);
+        let mut q = ground(p(Pattern::Quasicrystal));
+        let mut c = ground(p(Pattern::Checker));
+        let (q0, c0) = (q.albedo(pt, 1.0), c.albedo(pt, 1.0));
+        q.advance(1.3);
+        c.advance(1.3);
+        assert_ne!(q.albedo(pt, 1.0), q0, "quasicrystal moves");
+        assert_eq!(c.albedo(pt, 1.0), c0, "checker doesn't");
+        let still = GroundParams { wave_speed: 0.0, ..p(Pattern::Quasicrystal) };
+        let mut s = ground(still);
+        let s0 = s.albedo(pt, 1.0);
+        s.advance(5.0);
+        assert_eq!(s.albedo(pt, 1.0), s0, "speed 0 holds still");
+        assert_eq!("Quasicrystal".parse::<Pattern>().unwrap(), Pattern::Quasicrystal);
     }
 
     #[test]

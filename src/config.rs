@@ -96,6 +96,14 @@ pub struct Config {
     pub legend_pos: LegendPos,
     /// Inverted-luminosity wireframe over every solid (key `w`).
     pub wireframe: bool,
+    /// Solid tags: each solid's metric floats at a fixed place on screen with
+    /// a leader line to the solid (key `t`).
+    pub tags: bool,
+    /// Tag colour with a gradient on: `theme`, `complement`, `white` or
+    /// `#RRGGBB` (always lifted to stay readable on black).
+    pub tag_color: String,
+    /// Tag text as three-row block letters (for small text).
+    pub tag_blocks: bool,
 
     // --- colour ---
     /// `off`, a gradient preset (`inferno`, `viridis`, `traffic`, ...) or hex
@@ -148,6 +156,10 @@ pub struct Config {
     pub bg_rotate: Spin,
     /// Seconds per revolution.
     pub bg_rotate_period: f32,
+    /// Quasicrystal pattern: number of plane waves (3..=24; its symmetry).
+    pub bg_waves: u32,
+    /// Quasicrystal pattern: wave phase speed, radians/s (0 = still).
+    pub bg_wave_speed: f32,
 
     // --- animation ---
     pub min_scale: f32,
@@ -199,6 +211,9 @@ impl Default for Config {
             legend_opacity: LegendParams::default().opacity,
             legend_pos: LegendPos::TopLeft,
             wireframe: false,
+            tags: false,
+            tag_color: "complement".to_string(),
+            tag_blocks: false,
             color: "off".to_string(),
             color_by: ColorBy::Lum,
             color_depth: ColorDepth::True,
@@ -222,6 +237,8 @@ impl Default for Config {
             bg_sway_period: 10.0,
             bg_rotate: Spin::Off,
             bg_rotate_period: 60.0,
+            bg_waves: crate::scene::ground::WAVES_DEFAULT,
+            bg_wave_speed: crate::scene::ground::WAVE_SPEED_DEFAULT,
             min_scale: 0.45,
             max_scale: 1.0,
             max_spin: 3.0,
@@ -331,6 +348,8 @@ impl Config {
         self.bg_sway = finite_or(self.bg_sway, d.bg_sway).clamp(0.0, 100.0);
         self.bg_sway_period = finite_or(self.bg_sway_period, d.bg_sway_period).clamp(0.5, 86_400.0);
         self.bg_rotate_period = finite_or(self.bg_rotate_period, d.bg_rotate_period).clamp(0.5, 86_400.0);
+        self.bg_waves = self.bg_waves.clamp(crate::scene::ground::WAVES_MIN, crate::scene::ground::WAVES_MAX);
+        self.bg_wave_speed = finite_or(self.bg_wave_speed, d.bg_wave_speed).clamp(-20.0, 20.0);
         for v in [&mut self.orbit_radius, &mut self.orbit_height] {
             *v = v.filter(|x| x.is_finite()).map(|x| x.clamp(0.5, 500.0));
         }
@@ -367,7 +386,16 @@ impl Config {
             sway_period: self.bg_sway_period,
             rotate: self.bg_rotate,
             rotate_period: self.bg_rotate_period,
+            waves: self.bg_waves,
+            wave_speed: self.bg_wave_speed,
         }
+    }
+
+    /// Tag colour for this configuration's gradient (`cmap`); the default
+    /// text colour in monochrome or for an unknown `tag_color`.
+    pub fn tag_ink(&self, cmap: Option<&ColorMap>) -> u32 {
+        let mode = self.tag_color.parse::<crate::color::TagColor>().unwrap_or(crate::color::TagColor::Complement);
+        mode.resolve(cmap.map(|m| &m.gradient))
     }
 
     /// The colour mapping, or `None` for monochrome (`color = "off"`).

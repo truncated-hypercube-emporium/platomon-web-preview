@@ -263,6 +263,8 @@ pub struct Scene {
     pub ground: Ground,
     /// Top of the y-slab that contains every solid.
     pub slab_top: f32,
+    /// Circumradius of a solid at full size.
+    pub max_radius: f32,
     /// Rings: `ring_pos` is a ground point and solids rest on it. Sphere:
     /// `ring_pos` is the solid's centre.
     grounded: bool,
@@ -328,6 +330,7 @@ impl Scene {
             // Rotation centre: the focal point the camera looks at, on the ground.
             ground: Ground::new(&GroundParams::default(), Vec2::new(centroid.x, centroid.z)),
             slab_top: 2.0 * BASE_RADIUS + HOVER,
+            max_radius: BASE_RADIUS * anim.max_scale.max(anim.min_scale),
             grounded: layout == Layout::Rings,
             focus: None,
             challenger: None,
@@ -362,6 +365,13 @@ impl Scene {
         } else {
             self.ring_pos[i]
         };
+    }
+
+    /// Where solid `i`'s centre is when it is at full size (rings: solids
+    /// rest on the ground, so a bigger solid sits higher).
+    pub fn full_size_center(&self, i: usize) -> Vec3A {
+        let p = self.ring_pos.get(i).copied().unwrap_or(self.centroid);
+        if self.grounded { p + Vec3A::new(0.0, self.max_radius + HOVER, 0.0) } else { p }
     }
 
     /// Slot the focus camera is on (or heading to).

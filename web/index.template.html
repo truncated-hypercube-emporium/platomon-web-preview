@@ -125,7 +125,7 @@
       </div>
     </details>
     <div class="body" style="padding-top:10px">
-      <div class="hint">Keys: <kbd>g</kbd> settings · <kbd>s</kbd> stats · <kbd>l</kbd> legend · <kbd>w</kbd> wireframe · <kbd>space</kbd> pause</div>
+      <div class="hint">Keys: <kbd>g</kbd> settings · <kbd>s</kbd> stats · <kbd>l</kbd> legend · <kbd>w</kbd> wireframe · <kbd>t</kbd> tags · <kbd>space</kbd> pause</div>
       <div class="hint"><a href="readme/" style="color:inherit">Documentation (readme)</a></div>
     </div>
   </div>
@@ -191,11 +191,15 @@ const SECTIONS = [
     { id: "exposure", label: "Exposure", type: "range", min: 0.2, max: 4, step: 0.05, init: 1, def: 1 },
     { id: "show_stats", label: "Stats bar", type: "check", init: true, def: false, flag: "--stats" },
   ]},
-  { title: "Legend & wireframe", kind: "live", open: true, fields: [
+  { title: "Legend, tags & wireframe", kind: "live", open: true, fields: [
     { id: "legend", label: "Legend", type: "check", init: true, def: false, flag: "--legend" },
     { id: "legend_size", label: "Legend size", type: "range", min: 1, max: 5, step: 1, init: 2, def: 2, flag: "--legend-size" },
     { id: "legend_opacity", label: "Legend opacity", type: "range", min: 0, max: 1, step: 0.05, init: 0.85, def: 0.85, flag: "--legend-opacity" },
     { id: "legend_pos", label: "Legend corner", type: "select", options: ["top-left","top-right","bottom-left","bottom-right"], init: "top-left", def: "top-left", flag: "--legend-pos" },
+    { id: "tags", label: "Solid tags", type: "check", init: false, def: false, flag: "--tags" },
+    { id: "tag_color_mode", label: "Tag colour", type: "select", options: ["complement","theme","white","custom"], init: "complement", kind: "view" },
+    { id: "tag_color", label: "Tag hex", type: "text", init: "complement", def: "complement", flag: "--tag-color", placeholder: "#RRGGBB" },
+    { id: "tag_blocks", label: "Block letters", type: "check", init: false, def: false, flag: "--tag-blocks" },
     { id: "wireframe", label: "Wireframe", type: "check", init: false, def: false, flag: "--wireframe" },
   ]},
   { title: "Colour", kind: "live", fields: [
@@ -220,7 +224,9 @@ const SECTIONS = [
   ]},
   { title: "Background", kind: "live", fields: [
     { id: "bg_lum", label: "Luminosity", type: "range", min: 0, max: 10, step: 0.5, init: 5, def: 5, flag: "--bg-lum", fmt: v => v == 0 ? "off" : v },
-    { id: "bg_pattern", label: "Pattern", type: "select", options: ["solid","checker","diamond","brick","triangles","hex","radial"], init: "solid", def: "solid", flag: "--bg-pattern" },
+    { id: "bg_pattern", label: "Pattern", type: "select", options: ["solid","checker","diamond","brick","triangles","hex","radial","quasicrystal"], init: "solid", def: "solid", flag: "--bg-pattern" },
+    { id: "bg_waves", label: "Waves", type: "range", min: 3, max: 24, step: 1, init: 7, def: 7, flag: "--bg-waves", fmt: v => v + "-fold" },
+    { id: "bg_wave_speed", label: "Wave speed", type: "range", min: -3, max: 3, step: 0.1, init: 0.6, def: 0.6, flag: "--bg-wave-speed", fmt: v => v + " rad/s" },
     { id: "bg_contrast", label: "Contrast", type: "range", min: 0, max: 1, step: 0.05, init: 0.5, def: 0.5, flag: "--bg-contrast" },
     { id: "bg_scale", label: "Tile size", type: "range", min: 0.2, max: 5, step: 0.1, init: 1, def: 1, flag: "--bg-scale" },
     { id: "bg_scroll_x", label: "Scroll X /s", type: "range", min: -2, max: 2, step: 0.1, init: 0, def: 0 },
@@ -284,7 +290,8 @@ function tomlFor(v, rows, seed) {
   L.push("ramp = " + q(v.ramp), "char_aspect = " + num(v.char_aspect), "exposure = " + num(v.exposure),
          "show_stats = " + !!v.show_stats, "aspect = " + q(v.aspect), "aspect_mode = " + q(v.aspect_mode));
   L.push("legend = " + !!v.legend, "legend_size = " + int(v.legend_size), "legend_opacity = " + num(v.legend_opacity),
-         "legend_pos = " + q(v.legend_pos), "wireframe = " + !!v.wireframe);
+         "legend_pos = " + q(v.legend_pos), "wireframe = " + !!v.wireframe,
+         "tags = " + !!v.tags, "tag_color = " + q(v.tag_color || "complement"), "tag_blocks = " + !!v.tag_blocks);
   L.push("color = " + q(v.color || "off"), "color_by = " + q(v.color_by), "color_depth = " + q(v.color_depth),
          "color_reverse = " + !!v.color_reverse, "layout = " + q(v.layout));
   L.push("camera = " + q(v.camera), "orbit_period = " + num(v.orbit_period), "orbit_dir = " + q(v.orbit_dir),
@@ -295,7 +302,7 @@ function tomlFor(v, rows, seed) {
   L.push("bg_lum = " + num(v.bg_lum), "bg_pattern = " + q(v.bg_pattern), "bg_contrast = " + num(v.bg_contrast),
          "bg_scale = " + num(v.bg_scale), "bg_scroll = [" + num(v.bg_scroll_x) + ", " + num(v.bg_scroll_z) + "]",
          "bg_sway = " + num(v.bg_sway), "bg_sway_period = " + num(v.bg_sway_period), "bg_rotate = " + q(v.bg_rotate),
-         "bg_rotate_period = " + num(v.bg_rotate_period));
+         "bg_rotate_period = " + num(v.bg_rotate_period), "bg_waves = " + int(v.bg_waves), "bg_wave_speed = " + num(v.bg_wave_speed));
   L.push("min_scale = " + num(v.min_scale), "max_scale = " + num(v.max_scale), "idle_spin = " + num(v.idle_spin),
          "max_spin = " + num(v.max_spin), "smoothing_tau = " + num(v.smoothing_tau), "poll_hz = " + num(v.poll_hz));
   const solids = shown.filter(r => r.solid !== r.def), rings = shown.filter(r => r.ring !== "auto");
@@ -515,6 +522,9 @@ function syncControls() {
   $("f-char_aspect").disabled = !!values.char_auto;
   $("f-ramp").disabled = values.ramp_preset !== "custom";
   $("f-color").disabled = values.color_preset !== "custom";
+  $("f-tag_color").disabled = values.tag_color_mode !== "custom" || !values.tags;
+  for (const id of ["tag_color_mode", "tag_blocks"]) $("f-" + id).disabled = !values.tags;
+  for (const id of ["bg_waves", "bg_wave_speed"]) $("f-" + id).disabled = values.bg_pattern !== "quasicrystal";
   for (const id of ["color_by", "color_depth", "color_reverse"]) $("f-" + id).disabled = values.color === "off";
   for (const id of ["focus_zoom", "focus_tau"]) $("f-" + id).disabled = values.camera !== "focus";
   for (const id of ["orbit_period", "orbit_dir", "orbit_bob", "orbit_radius", "orbit_height"]) $("f-" + id).disabled = values.camera !== "orbit";
@@ -554,6 +564,7 @@ function markPending() {
 
 function onChange(f) {
   if (f.id === "ramp_preset" && values.ramp_preset !== "custom") values.ramp = RAMPS[values.ramp_preset];
+  if (f.id === "tag_color_mode") values.tag_color = values.tag_color_mode === "custom" ? "#ffcc00" : values.tag_color_mode;
   if (f.id === "color_preset") values.color = values.color_preset === "custom" ? "#000:#f80:#fff" : values.color_preset;
   if (f.id === "fps_min" && values.fps_max < values.fps_min) values.fps_max = values.fps_min;
   if (f.id === "fps_max" && values.fps_min > values.fps_max) values.fps_min = values.fps_max;
@@ -562,7 +573,7 @@ function onChange(f) {
   if (f.kind === "sim") sendSim();
   if (f.kind === "sound") sendSound(f.id === "sound_source");
   if (f.id === "font" || f.id === "char_auto") measure();
-  if (liveMode && (f.kind === "live" || f.id === "ramp_preset" || f.id === "color_preset" || f.id === "char_auto" || f.id === "font")) applyLive();
+  if (liveMode && (f.kind === "live" || f.id === "ramp_preset" || f.id === "color_preset" || f.id === "tag_color_mode" || f.id === "char_auto" || f.id === "font")) applyLive();
   syncControls();
 }
 
@@ -705,6 +716,7 @@ window.addEventListener("keydown", e => {
   else if (k === "s") toggleField("show_stats");
   else if (k === "l") toggleField("legend");
   else if (k === "w") toggleField("wireframe");
+  else if (k === "t") toggleField("tags");
   else if (k === " ") { paused = !paused; e.preventDefault(); }
   else return;
 });

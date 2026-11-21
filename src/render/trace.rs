@@ -4,7 +4,8 @@
 use glam::Vec3A;
 use std::f32::consts::TAU;
 
-use super::march::{GROUND, Hit, march, march_solids, normal};
+use super::lut::ShadowGrid;
+use super::march::{ALL_SOLIDS, GROUND, Hit, march_in, march_solids_in, normal};
 use crate::scene::Scene;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -45,6 +46,46 @@ pub fn cosine_hemisphere(n: Vec3A, rng: &mut fastrand::Rng) -> Vec3A {
     (t * (r * c) + b * (r * s) + n * (1.0 - u1).max(0.0).sqrt()).normalize()
 }
 
+/// Lookup-table size (entries) for the sampling tables below.
+const LUT_BITS: u32 = 12;
+const LUT_N: usize = 1 << LUT_BITS;
+
+/// Sine and cosine of `TAU · k / LUT_N`.
+fn sin_cos_table() -> &'static [(f32, f32)] {
+    static T: std::sync::OnceLock<Box<[(f32, f32)]>> = std::sync::OnceLock::new();
+    T.get_or_init(|| (0..LUT_N).map(|k| (TAU * (k as f32 + 0.5) / LUT_N as f32).sin_cos()).collect())
+}
+
+/// Cosine-weighted directions around +Y (the ground's normal), stratified
+/// on a 64 × 64 grid of the two sample coordinates.
+fn ground_bounce_table() -> &'static [Vec3A] {
+    static T: std::sync::OnceLock<Box<[Vec3A]>> = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        let side = 1usize << (LUT_BITS / 2);
+        (0..LUT_N)
+            .map(|k| {
+                let u1 = ((k / side) as f32 + 0.5) / side as f32;
+                let u2 = ((k % side) as f32 + 0.5) / side as f32;
+                let r = u1.sqrt();
+                let (s, c) = (TAU * u2).sin_cos();
+                Vec3A::new(r * c, (1.0 - u1).max(0.0).sqrt(), r * s).normalize()
+            })
+            .collect()
+    })
+}
+
+/// A random table index.
+#[inline(always)]
+fn lut_index(rng: &mut fastrand::Rng) -> usize {
+    (rng.u32(..) >> (32 - LUT_BITS)) as usize
+}
+
+/// Cosine-weighted bounce off the ground (normal +Y), from the table.
+#[inline(always)]
+fn ground_bounce(rng: &mut fastrand::Rng) -> Vec3A {
+    ground_bounce_table()[lut_index(rng)]
+}
+
 /// Distance along the ray to the light sphere, if hit.
 #[inline(always)]
 fn light_hit(scene: &Scene, ro: Vec3A, rd: Vec3A) -> Option<f32> {
@@ -63,7 +104,7 @@ fn light_hit(scene: &Scene, ro: Vec3A, rd: Vec3A) -> Option<f32> {
 /// Direct light at `p` (normal `n`) by solid-angle sampling of the light
 /// sphere. Returns radiance / albedo.
 #[inline]
-fn direct_light(scene: &Scene, p: Vec3A, n: Vec3A, rng: &mut fastrand::Rng, s: &TraceSettings) -> f32 {
+fn direct_light(scene: &Scene, p: Vec3A, n: Vec3A, rng: &mut fastrand::Rng, s: &TraceSettings, occluders: u64) -> f32 {
     let l = &scene.light;
     let to_c = l.center - p;
     let d2 = to_c.length_squared();
@@ -73,10 +114,9 @@ fn direct_light(scene: &Scene, p: Vec3A, n: Vec3A, rng: &mut fastrand::Rng, s: &
     let cos_max = (1.0 - sin2_max).sqrt();
 
     let u1 = rng.f32();
-    let u2 = rng.f32();
     let cos_t = 1.0 - u1 * (1.0 - cos_max);
     let sin_t = (1.0 - cos_t * cos_t).max(0.0).sqrt();
-    let (sp, cp) = (TAU * u2).sin_cos();
+    let (sp, cp) = sin_cos_table()[lut_index(rng)];
     let (t, b) = onb(w);
     let dir = t * (cp * sin_t) + b * (sp * sin_t) + w * cos_t;
 
@@ -85,7 +125,7 @@ fn direct_light(scene: &Scene, p: Vec3A, n: Vec3A, rng: &mut fastrand::Rng, s: &
         return 0.0;
     }
     // Light is above the ground, so only solids can occlude it.
-    if march_solids(scene, p, dir, 0.0, d - l.radius, s.max_steps).is_some() {
+    if march_solids_in(scene, p, dir, 0.0, d - l.radius, s.max_steps, occluders).is_some() {
         return 0.0;
     }
     // (albedo/π)·L·cosθ / pdf, pdf = 1 / (2π(1 − cosθmax)); albedo applied by caller
@@ -94,24 +134,29 @@ fn direct_light(scene: &Scene, p: Vec3A, n: Vec3A, rng: &mut fastrand::Rng, s: &
 
 /// Radiance along one camera ray.
 pub fn radiance(scene: &Scene, ro: Vec3A, rd: Vec3A, rng: &mut fastrand::Rng, s: &TraceSettings) -> f32 {
-    radiance_primary(scene, ro, rd, rng, s).0
+    radiance_primary(scene, ro, rd, rng, s, ALL_SOLIDS, None).0
 }
 
 /// Radiance along one camera ray, plus the primary hit (`None` when the ray
-/// escapes or sees the light first).
+/// escapes or sees the light first). `primary_solids`: the solids the camera
+/// ray can possibly hit (from the screen-tile table; [`ALL_SOLIDS`] if
+/// unknown).
 pub fn radiance_primary(
     scene: &Scene,
     mut ro: Vec3A,
     mut rd: Vec3A,
     rng: &mut fastrand::Rng,
     s: &TraceSettings,
+    primary_solids: u64,
+    shadows: Option<&ShadowGrid>,
 ) -> (f32, Option<Hit>) {
     let mut acc = 0.0f32;
     let mut throughput = 1.0f32;
     let mut primary = None;
 
     for depth in 0..=s.bounces {
-        let hit = march(scene, ro, rd, s.max_dist, s.max_steps);
+        let allowed = if depth == 0 { primary_solids } else { ALL_SOLIDS };
+        let hit = march_in(scene, ro, rd, s.max_dist, s.max_steps, allowed);
 
         if depth == 0 {
             if let Some(tl) = light_hit(scene, ro, rd)
@@ -132,7 +177,12 @@ pub fn radiance_primary(
         let albedo = if h.id == GROUND { scene.ground.albedo(p, h.t) } else { scene.solids[h.id as usize].albedo };
         let origin = p + n * RAY_OFFSET;
 
-        acc += throughput * albedo * direct_light(scene, origin, n, rng, s);
+        // On the ground, only solids whose shadow can reach this point occlude.
+        let occluders = match shadows {
+            Some(g) if h.id == GROUND => g.at(p.x, p.z),
+            _ => ALL_SOLIDS,
+        };
+        acc += throughput * albedo * direct_light(scene, origin, n, rng, s, occluders);
 
         if depth == s.bounces {
             // Truncated path: approximate the remaining sky light.
@@ -141,7 +191,7 @@ pub fn radiance_primary(
         }
         throughput *= albedo;
         ro = origin;
-        rd = cosine_hemisphere(n, rng);
+        rd = if h.id == GROUND { ground_bounce(rng) } else { cosine_hemisphere(n, rng) };
     }
     (acc, primary)
 }

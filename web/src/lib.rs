@@ -49,6 +49,8 @@ pub struct App {
     target: f32,
     activity: f32,
     labels: Vec<String>,
+    /// Solid tags (key `t`): one short reading per solid.
+    tag_labels: Vec<String>,
     cmap: Option<ColorMap>,
     levels: Vec<f32>,
     text: String,
@@ -168,6 +170,7 @@ pub fn load(toml: &str) -> Result<(Config, Vec<SlotSpec>, Option<f32>), String> 
     let slots = cfg.resolve_slots()?;
     let ratio = aspect::parse_aspect(&cfg.aspect)?;
     cfg.color_map().map_err(|e| format!("color: {e}"))?;
+    cfg.tag_color.parse::<color::TagColor>().map_err(|e| format!("tag_color: {e}"))?;
     Ok((cfg, slots, ratio))
 }
 
@@ -196,6 +199,7 @@ impl App {
             target,
             activity: 0.0,
             labels: Vec::new(),
+            tag_labels: Vec::new(),
             cmap: cfg.color_map().ok().flatten(),
             levels: Vec::new(),
             text: String::new(),
@@ -236,6 +240,9 @@ impl App {
         c.legend_opacity = new.legend_opacity;
         c.legend_pos = new.legend_pos;
         c.wireframe = new.wireframe;
+        c.tags = new.tags;
+        c.tag_color = new.tag_color.clone();
+        c.tag_blocks = new.tag_blocks;
         c.color = new.color.clone();
         c.color_by = new.color_by;
         c.color_depth = new.color_depth;
@@ -262,6 +269,8 @@ impl App {
             c.bg_sway_period = new.bg_sway_period;
             c.bg_rotate = new.bg_rotate;
             c.bg_rotate_period = new.bg_rotate_period;
+            c.bg_waves = new.bg_waves;
+            c.bg_wave_speed = new.bg_wave_speed;
         }
         self.target = self.target.clamp(c.fps_min, c.fps_max);
         // Halo-only frames wait for a full frame with the new settings.
@@ -329,6 +338,10 @@ impl App {
             let block = self.cfg.legend_size >= 3;
             self.labels.extend(readings.iter().map(|r| if block { ui::short_label(r) } else { ui::segment(r) }));
         }
+        if self.cfg.tags {
+            self.tag_labels.clear();
+            self.tag_labels.extend(readings.iter().map(|r| ui::short_label(r)));
+        }
         let halo = self.sound.next((dt - std::mem::take(&mut self.halo_time)).max(0.0));
         let ramp = Ramp::new(&self.cfg.ramp);
         let legend = self.cfg.legend_params();
@@ -343,6 +356,10 @@ impl App {
             levels: &self.levels,
             halo,
             halo_factors: self.sound.factors(),
+            tags: self.cfg.tags,
+            tag_labels: &self.tag_labels,
+            tag_ink: self.cfg.tag_ink(self.cmap.as_ref()),
+            tag_blocks: self.cfg.tag_blocks,
         };
         self.pic_chars.clear();
         self.pic_colors.clear();
@@ -400,6 +417,10 @@ impl App {
             levels: &self.levels,
             halo,
             halo_factors: self.sound.factors(),
+            tags: self.cfg.tags,
+            tag_labels: &self.tag_labels,
+            tag_ink: self.cfg.tag_ink(self.cmap.as_ref()),
+            tag_blocks: self.cfg.tag_blocks,
         };
         let view = self.renderer.view()?;
         let vp = last.vp;
@@ -718,6 +739,7 @@ mod tests {
         assert!(load("nope = 1").is_err());
         assert!(load("color = \"plaid\"").unwrap_err().contains("unknown gradient"));
         assert!(load("layout = \"cube\"").is_err());
+        assert!(load("tag_color = \"plaid\"").unwrap_err().contains("tag_color"));
     }
 
     #[test]
@@ -801,6 +823,26 @@ mod tests {
         assert!(s.meter.0 > 0.7, "peak {:?}", s.meter);
         assert!(s.meter.1 > 0.3, "60 Hz counts as bass {:?}", s.meter);
         assert!(s.last().unwrap().factor > 1.2 && s.factors().is_empty());
+    }
+
+    #[test]
+    fn tags_and_quasicrystal_render() {
+        let mut a = app("tags = true\ntag_blocks = false\nshow_stats = true\nbg_pattern = \"quasicrystal\"\nbg_waves = 9\n");
+        let plain = {
+            let mut b = app("show_stats = true\nbg_pattern = \"quasicrystal\"\nbg_waves = 9\n");
+            b.set_sound(Source::Off, false, true);
+            b.frame(0.1, 120, 40, 10.0, 0.01).to_string()
+        };
+        a.set_sound(Source::Off, false, true);
+        let t = a.frame(0.1, 120, 40, 10.0, 0.01).to_string();
+        assert_eq!(t.split('\n').count(), 40);
+        assert!(t.lines().take(39).any(|l| l.contains("CPU")), "a tag names its metric");
+        assert!(!plain.lines().take(39).any(|l| l.contains("CPU")));
+        let (c, _, r) = load("tags = true\ncolor = \"viridis\"\ntag_color = \"#ff0000\"\nbg_pattern = \"quasicrystal\"\nbg_wave_speed = 0.0\n").unwrap();
+        a.apply_live(&c, r);
+        assert_eq!((a.cfg.tag_color.as_str(), a.cfg.bg_wave_speed), ("#ff0000", 0.0));
+        a.frame(0.1, 120, 40, 10.0, 0.01);
+        assert!(!a.colors().is_empty());
     }
 
     #[test]

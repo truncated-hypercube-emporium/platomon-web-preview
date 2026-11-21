@@ -1,5 +1,6 @@
 //! Per-pixel ray generation, parallel over rows, plus the adaptive-quality governor.
 
+pub mod lut;
 pub mod march;
 pub mod trace;
 
@@ -98,7 +99,13 @@ pub struct Renderer {
     ids: Vec<u8>,
     proj: Option<Projection>,
     frame: u64,
+    /// Per-frame lookup tables ([`lut`]): solids per screen tile, and solids
+    /// that can shadow each part of the ground.
+    tiles: Vec<u64>,
+    shadows: lut::ShadowGrid,
 }
+
+pub use lut::TILE;
 
 #[inline]
 fn seed(frame: u64, row: usize) -> u64 {
@@ -126,6 +133,10 @@ impl Renderer {
         let inv_spp = 1.0 / spp as f32;
         let frame = self.frame;
         let ts = rs.trace;
+        let tx = lut::tile_masks(scene, &proj, w, h, &mut self.tiles);
+        let tiles = &self.tiles;
+        self.shadows.build(scene);
+        let shadows = &self.shadows;
 
         // Rows in parallel natively; the browser build has one thread.
         #[cfg(not(target_arch = "wasm32"))]
@@ -135,13 +146,15 @@ impl Renderer {
         rows.enumerate()
             .for_each(|(y, ((row, drow), irow))| {
                 let mut rng = fastrand::Rng::with_seed(seed(frame, y));
+                let tile_row = &tiles[(y / TILE) * tx..(y / TILE + 1) * tx];
                 for (x, out) in row.iter_mut().enumerate() {
+                    let allowed = tile_row[x / TILE];
                     let mut sum = 0.0;
                     for s in 0..spp {
                         // First sample through the pixel centre, which also fills the G-buffer.
                         let (jx, jy) = if s == 0 { (0.5, 0.5) } else { (rng.f32(), rng.f32()) };
                         let rd = proj.ray(x as f32 + jx, y as f32 + jy);
-                        let (l, hit) = trace::radiance_primary(scene, origin, rd, &mut rng, &ts);
+                        let (l, hit) = trace::radiance_primary(scene, origin, rd, &mut rng, &ts, allowed, Some(shadows));
                         if s == 0 {
                             (drow[x], irow[x]) = hit.map_or((f32::INFINITY, NO_HIT), |h| (h.t, h.id));
                         }

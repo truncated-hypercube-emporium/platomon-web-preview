@@ -36,7 +36,7 @@ enum ListWhat {
 /// Platonic-solid ASCII system monitor.
 ///
 /// One path-traced solid per metric, on concentric rings. Keys: s = stats bar,
-/// l = legend, w = wireframe, q / Esc / Ctrl-C = quit.
+/// l = legend, w = wireframe, t = tags, q / Esc / Ctrl-C = quit.
 #[derive(Parser, Debug)]
 #[command(name = "platomon", version, about, long_about = None)]
 struct Cli {
@@ -112,6 +112,15 @@ struct Cli {
     /// Overlay each solid's wireframe in inverted luminosity (key w).
     #[arg(long)]
     wireframe: bool,
+    /// Tag each solid with its metric: the text travels with the solid, with a short line to it (key t).
+    #[arg(long)]
+    tags: bool,
+    /// Tag colour with a gradient: theme, complement (default), white or #RRGGBB; lifted to stay readable.
+    #[arg(long, value_name = "MODE|#RRGGBB")]
+    tag_color: Option<String>,
+    /// Draw tag text as three-row block letters, easier to read on small fonts.
+    #[arg(long)]
+    tag_blocks: bool,
 
     // ---- colour
     /// Colour gradient: off, a preset (see --list gradients) or hex stops like "#000:#f80:#fff".
@@ -173,7 +182,7 @@ struct Cli {
     /// Background luminosity 0..10: 5 = original, 0 = no background surface.
     #[arg(long, value_name = "0..10")]
     bg_lum: Option<f32>,
-    /// Background pattern: solid, checker, diamond, brick, triangles, hex, radial.
+    /// Background pattern: solid, checker, diamond, brick, triangles, hex, radial, quasicrystal.
     #[arg(long, value_name = "PATTERN")]
     bg_pattern: Option<Pattern>,
     /// Pattern tone spread around the luminosity, 0..1.
@@ -197,6 +206,12 @@ struct Cli {
     /// Seconds per background revolution.
     #[arg(long, value_name = "SECS")]
     bg_rotate_period: Option<f32>,
+    /// Quasicrystal background: number of plane waves, 3..24 (its rotational symmetry; default 7).
+    #[arg(long, value_name = "N")]
+    bg_waves: Option<u32>,
+    /// Quasicrystal background: wave phase speed in radians/s; 0 = still, negative = reverse (default 0.6).
+    #[arg(long, value_name = "RAD/S", allow_hyphen_values = true)]
+    bg_wave_speed: Option<f32>,
 }
 
 fn fail(msg: impl std::fmt::Display) -> ! {
@@ -209,7 +224,7 @@ fn apply_cli(cfg: &mut Config, cli: &Cli) -> Result<(), String> {
         ($($f:ident),*) => { $( if let Some(v) = cli.$f.clone() { cfg.$f = v; } )* };
     }
     set!(spp, bounces, fps_min, fps_max, ramp, char_aspect, aspect, aspect_mode, camera, orbit_period, orbit_dir, orbit_bob);
-    set!(bg_lum, bg_pattern, bg_contrast, bg_scale, bg_sway, bg_sway_period, bg_rotate, bg_rotate_period);
+    set!(bg_lum, bg_pattern, bg_contrast, bg_scale, bg_sway, bg_sway_period, bg_rotate, bg_rotate_period, bg_waves, bg_wave_speed);
     set!(legend_size, legend_opacity, legend_pos);
     set!(color, color_by, color_depth, layout, focus_zoom, focus_tau);
     if cli.color_reverse {
@@ -224,6 +239,16 @@ fn apply_cli(cfg: &mut Config, cli: &Cli) -> Result<(), String> {
     }
     if cli.wireframe {
         cfg.wireframe = true;
+    }
+    if cli.tags {
+        cfg.tags = true;
+    }
+    if cli.tag_blocks {
+        cfg.tag_blocks = true;
+    }
+    if let Some(c) = &cli.tag_color {
+        c.parse::<platomon::color::TagColor>().map_err(|e| format!("--tag-color: {e}"))?;
+        cfg.tag_color = c.clone();
     }
     if cli.fps_invert {
         cfg.fps_invert = true;
@@ -325,11 +350,11 @@ fn list(what: ListWhat) {
             println!("\nNAME: see --list sensors. Without NAME the busiest instance is used.");
         }
         ListWhat::Patterns => {
-            println!("{:<10} DESCRIPTION", "PATTERN");
+            println!("{:<13} DESCRIPTION", "PATTERN");
             for p in Pattern::ALL {
-                println!("{:<10} {}", p.id(), p.describe());
+                println!("{:<13} {}", p.id(), p.describe());
             }
-            println!("\nTiles alternate around --bg-lum by --bg-contrast; --bg-scale sets tile size.");
+            println!("\nTiles alternate around --bg-lum by --bg-contrast; --bg-scale sets tile size (the quasicrystal's wavelength).");
         }
         ListWhat::Gradients => {
             println!("{:<9} {:<32} DESCRIPTION", "GRADIENT", "SWATCH (24-bit)");
@@ -454,6 +479,10 @@ fn snapshot(cfg: &Config, slots: &[SlotSpec], ratio: Option<f32>, (w, h): (usize
         levels: &ch.iter().map(|c| c.level).collect::<Vec<_>>(),
         halo: None,
         halo_factors: &[],
+        tags: cfg.tags,
+        tag_labels: &labels,
+        tag_ink: cfg.tag_ink(cmap.as_ref()),
+        tag_blocks: cfg.tag_blocks,
     };
     let mut overlays = Overlays::new(&scene);
     let mut s = String::new();
@@ -656,7 +685,10 @@ fn run(
     let legend = cfg.legend_params();
     let mut show_legend = cfg.legend;
     let mut wireframe = cfg.wireframe;
+    let mut tags = cfg.tags;
+    let tag_ink = cfg.tag_ink(cmap);
     let mut labels: Vec<String> = Vec::new();
+    let mut tag_labels: Vec<String> = Vec::new();
 
     loop {
         // Wait for the frame deadline, staying responsive to input. Input is
@@ -675,6 +707,7 @@ fn run(
                     }
                     Action::ToggleLegend => show_legend = !show_legend,
                     Action::ToggleWireframe => wireframe = !wireframe,
+                    Action::ToggleTags => tags = !tags,
                     Action::Resize(w, h) => {
                         (cols, rows) = (w, h);
                         need_clear = true;
@@ -728,6 +761,10 @@ fn run(
         if show_legend {
             legend_labels(&readings, legend.size, &mut labels);
         }
+        if tags {
+            tag_labels.clear();
+            tag_labels.extend(readings.iter().map(|r| ui::short_label(r)));
+        }
         let opt = OverlayOptions {
             wireframe,
             legend: show_legend.then_some(&legend),
@@ -739,6 +776,10 @@ fn run(
             levels: &levels,
             halo: None,
             halo_factors: &[],
+            tags,
+            tag_labels: &tag_labels,
+            tag_ink,
+            tag_blocks: cfg.tag_blocks,
         };
         if let Some(view) = renderer.view() {
             let cells = overlays.compose(&view, vp.w, vp.h, &scene, &opt);
