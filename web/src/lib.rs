@@ -537,8 +537,13 @@ struct Host {
     sim: Sim,
     /// Sound settings, kept across restarts: source, halo swing, bands.
     sound: (Source, f32, bool),
-    /// The rendered chiptune loop, until the page has copied it.
+    /// The rendered chiptune loop and its rate (kept while it plays: the
+    /// halo reads it at the page's playback position), and its WAV file
+    /// until the page has copied it.
     tune: Vec<f32>,
+    tune_rate: f32,
+    tune_wav: Vec<u8>,
+    tune_window: Vec<f32>,
     /// Tag block scale and font, kept across restarts.
     tag_style: (u8, u32),
     /// Samples written by the page (see [`audio_buffer`]).
@@ -640,24 +645,53 @@ pub extern "C" fn set_tag_style(scale: u32, font: u32) {
     })
 }
 
-/// Render the [`chiptune`] loop at `rate` Hz; returns its length in samples
-/// (read them at [`chiptune_ptr`], then call [`chiptune_free`]).
+/// Render the [`chiptune`] loop at `rate` Hz as a WAV file for the page's
+/// media element; returns its length in bytes (read them at
+/// [`chiptune_wav_ptr`], then call [`chiptune_wav_free`]).
 #[unsafe(no_mangle)]
-pub extern "C" fn chiptune_render(rate: f32) -> usize {
+pub extern "C" fn chiptune_wav(rate: u32) -> usize {
     HOST.with_borrow_mut(|h| {
-        h.tune = chiptune::render(rate);
-        h.tune.len()
+        let rate = rate.clamp(8_000, 96_000);
+        h.tune = chiptune::render(rate as f32);
+        h.tune_rate = rate as f32;
+        h.tune_wav = chiptune::wav(&h.tune, rate);
+        h.tune_wav.len()
     })
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn chiptune_ptr() -> *const f32 {
-    HOST.with_borrow(|h| h.tune.as_ptr())
+pub extern "C" fn chiptune_wav_ptr() -> *const u8 {
+    HOST.with_borrow(|h| h.tune_wav.as_ptr())
 }
 
+/// Drop the WAV bytes (the samples stay for [`chiptune_push`]).
 #[unsafe(no_mangle)]
-pub extern "C" fn chiptune_free() {
-    HOST.with_borrow_mut(|h| h.tune = Vec::new())
+pub extern "C" fn chiptune_wav_free() {
+    HOST.with_borrow_mut(|h| h.tune_wav = Vec::new())
+}
+
+/// Feed the halo the chiptune samples just before `t` seconds into the loop
+/// (the media element's playback position); a negative `t` (paused) feeds
+/// silence. Sound source 2 only.
+#[unsafe(no_mangle)]
+pub extern "C" fn chiptune_push(t: f64) {
+    HOST.with_borrow_mut(|h| {
+        let Host { app, tune, tune_rate, tune_window, .. } = h;
+        let t = if t >= 0.0 { t } else { f64::NAN };
+        chiptune::window_at(tune, *tune_rate, t, platomon::audio::FFT_N, tune_window);
+        if let Some(app) = app.as_mut() {
+            app.sound_mut().set_window(tune_window, *tune_rate);
+        }
+    })
+}
+
+/// Free the chiptune samples (when another source is chosen).
+#[unsafe(no_mangle)]
+pub extern "C" fn chiptune_stop() {
+    HOST.with_borrow_mut(|h| {
+        h.tune = Vec::new();
+        h.tune_wav = Vec::new();
+    })
 }
 
 /// Reserve room for `len` f32 samples for [`audio_push`]; returns the address.

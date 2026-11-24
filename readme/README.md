@@ -54,8 +54,10 @@ on its own between full frames, up to the frame-rate cap. Sources: **simulated m
 silent built-in 120 bpm track whose sections favour bass, mids or treble in turn), **microphone**
 (needs the https page; the audio stays in the browser), or **chiptune**: a 16-bar loop in A minor at
 150 bpm (25.6 s) in 8-bit style (pulse-wave lead with vibrato, pulse arpeggio, 4-bit triangle bass,
-noise drums), played aloud with its own volume slider and analysed as it plays, so the halo follows
-what you hear. *Halo colour* picks what colours the halo: what it passes over, its solid, its size or
+noise drums). It is rendered to a WAV file and played by the browser's own media element (so it
+plays with a phone's silent switch on and shows in the browser's media controls), with its own volume
+slider; the halo reads the same samples at the playback position, so it follows what you hear. If the
+browser blocks autoplay, the next click or tap starts it. *Halo colour* picks what colours the halo: what it passes over, its solid, its size or
 the bass.
 
 Tags have a position (circle, beside, corner, below, trailing); with block letters the web preview

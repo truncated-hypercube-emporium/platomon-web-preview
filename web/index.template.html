@@ -443,8 +443,14 @@ const capturing = () => !!audio;
 function stopCapture() {
   if (!audio) return;
   if (audio.stream) for (const t of audio.stream.getTracks()) t.stop();
-  if (audio.player) { try { audio.player.stop(); } catch (_) {} }
-  audio.ctx.close().catch(() => {});
+  if (audio.el) {
+    audio.el.pause(); audio.el.removeAttribute("src"); audio.el.load();
+    URL.revokeObjectURL(audio.url);
+    document.removeEventListener("pointerdown", audio.unlock);
+    W.chiptune_stop();
+    if (navigator.mediaSession) navigator.mediaSession.metadata = null;
+  }
+  if (audio.ctx) audio.ctx.close().catch(() => {});
   audio = null;
 }
 
@@ -468,25 +474,35 @@ async function startMicrophone() {
   });
 }
 
-// The chiptune is rendered by the wasm side, played on a loop and analysed
-// on its way to the speakers, so the halo follows exactly what is heard.
+// The chiptune is rendered by the wasm side as a WAV file and played by an
+// ordinary <audio> element: the browser's own media pipeline (it plays with
+// the phone's silent switch on, shows in the media controls, follows the
+// tab's mute). The halo reads the same rendered samples at the element's
+// playback position, so it moves with what is heard.
 async function startChiptune() {
   stopCapture();
-  const { ctx, analyser } = await newContext();
-  const n = W.chiptune_render(ctx.sampleRate);
-  const buffer = ctx.createBuffer(1, n, ctx.sampleRate);
-  buffer.copyToChannel(new Float32Array(W.memory.buffer, W.chiptune_ptr(), n), 0);
-  W.chiptune_free();
-  const player = ctx.createBufferSource();
-  player.buffer = buffer; player.loop = true;
-  const gain = ctx.createGain(); gain.gain.value = Number(values.volume);
-  player.connect(analyser); player.connect(gain); gain.connect(ctx.destination);
-  player.start();
-  audio = { ctx, analyser, player, gain, buf: new Float32Array(2048), kind: "chiptune" };
+  const rate = 44100;
+  const n = W.chiptune_wav(rate);
+  const bytes = new Uint8Array(W.memory.buffer, W.chiptune_wav_ptr(), n).slice();
+  W.chiptune_wav_free();
+  const url = URL.createObjectURL(new Blob([bytes], { type: "audio/wav" }));
+  const el = new Audio();
+  el.src = url; el.loop = true; el.preload = "auto"; el.volume = Number(values.volume);
+  const unlock = () => el.play().then(() => { $("msg").className = "ok"; $("msg").textContent = "Playing the chiptune (loops every 25.6 s)."; }, () => {});
+  audio = { el, url, unlock, kind: "chiptune" };
+  if (navigator.mediaSession && window.MediaMetadata)
+    navigator.mediaSession.metadata = new MediaMetadata({ title: "platomon chiptune", artist: "platomon web preview" });
+  try { await el.play(); return true; }
+  catch (e) {
+    // Autoplay refused (no user gesture yet): start on the next click or tap.
+    document.addEventListener("pointerdown", unlock, { once: true });
+    return false;
+  }
 }
 
 function pushAudio() {
   if (!audio) return;
+  if (audio.el) { W.chiptune_push(audio.el.paused ? -1 : audio.el.currentTime); return; }
   audio.analyser.getFloatTimeDomainData(audio.buf);
   const ptr = W.audio_buffer(audio.buf.length);
   new Float32Array(W.memory.buffer, ptr, audio.buf.length).set(audio.buf);
@@ -500,13 +516,15 @@ function sendTagStyle() {
 
 async function sendSound(sourceChanged) {
   const src = values.sound_source;
-  if (audio && audio.gain) audio.gain.gain.value = Number(values.volume);
+  if (audio && audio.el) audio.el.volume = Number(values.volume);
   const wide = Math.max(0, ["±10%", "±30%", "±60%"].indexOf(values.halo_wide)), bands = values.halo_bands === "by frequency" ? 1 : 0;
   if (sourceChanged) {
     if (src === "microphone" || src === "chiptune") {
       try {
-        if (src === "microphone") await startMicrophone(); else await startChiptune();
-        $("msg").className = "ok"; $("msg").textContent = src === "chiptune" ? "Playing the chiptune (loops every 25.6 s)." : "Listening to the microphone.";
+        const playing = src === "microphone" ? (await startMicrophone(), true) : await startChiptune();
+        $("msg").className = "ok";
+        $("msg").textContent = src === "microphone" ? "Listening to the microphone." :
+          playing ? "Playing the chiptune (loops every 25.6 s)." : "Click or tap anywhere to start the chiptune.";
       } catch (e) {
         $("msg").className = ""; $("msg").textContent = "Sound: " + (e && e.message || e) + " — using simulated music.";
         values.sound_source = "simulated music"; syncControls();

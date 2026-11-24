@@ -268,18 +268,10 @@ mod probe {
     }
 }
 
-/// Write the loop as 16-bit mono WAV to `$PLATOMON_WAV` (to listen to it
-/// outside the page): `PLATOMON_WAV=tune.wav cargo test -p platomon-web
-/// chiptune_wav -- --ignored`.
-#[cfg(test)]
-#[test]
-#[ignore]
-fn chiptune_wav() {
-    let Ok(path) = std::env::var("PLATOMON_WAV") else { return };
-    let rate = 44_100u32;
-    let s = render(rate as f32);
-    let mut b = Vec::with_capacity(44 + s.len() * 2);
-    let data = (s.len() * 2) as u32;
+/// `samples` (-1..1, mono) at `rate` Hz as a 16-bit PCM WAV file.
+pub fn wav(samples: &[f32], rate: u32) -> Vec<u8> {
+    let data = (samples.len() * 2) as u32;
+    let mut b = Vec::with_capacity(44 + samples.len() * 2);
     b.extend_from_slice(b"RIFF");
     b.extend_from_slice(&(36 + data).to_le_bytes());
     b.extend_from_slice(b"WAVEfmt ");
@@ -287,13 +279,62 @@ fn chiptune_wav() {
     b.extend_from_slice(&1u16.to_le_bytes()); // PCM
     b.extend_from_slice(&1u16.to_le_bytes()); // mono
     b.extend_from_slice(&rate.to_le_bytes());
-    b.extend_from_slice(&(rate * 2).to_le_bytes());
-    b.extend_from_slice(&2u16.to_le_bytes());
-    b.extend_from_slice(&16u16.to_le_bytes());
+    b.extend_from_slice(&(rate * 2).to_le_bytes()); // bytes per second
+    b.extend_from_slice(&2u16.to_le_bytes()); // block align
+    b.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
     b.extend_from_slice(b"data");
     b.extend_from_slice(&data.to_le_bytes());
-    for v in s {
-        b.extend_from_slice(&((v * 32_000.0) as i16).to_le_bytes());
+    for &v in samples {
+        let v = if v.is_finite() { v.clamp(-1.0, 1.0) } else { 0.0 };
+        b.extend_from_slice(&((v * 32_767.0).round() as i16).to_le_bytes());
     }
-    std::fs::write(path, b).unwrap();
+    b
+}
+
+/// The `n` samples of the loop `tune` ending at `t` seconds into it
+/// (wrapping round the loop's end), at `rate` Hz, written to `out`.
+pub fn window_at(tune: &[f32], rate: f32, t: f64, n: usize, out: &mut Vec<f32>) {
+    out.clear();
+    if tune.is_empty() || !t.is_finite() || rate <= 0.0 {
+        out.resize(n, 0.0);
+        return;
+    }
+    let len = tune.len() as i64;
+    let end = (t * rate as f64).round() as i64;
+    out.extend((0..n as i64).map(|k| tune[(end - n as i64 + k).rem_euclid(len) as usize]));
+}
+
+/// Write the loop as a WAV file to `$PLATOMON_WAV` (to listen to it outside
+/// the page): `PLATOMON_WAV=tune.wav cargo test -p platomon-web chiptune_wav
+/// -- --ignored`.
+#[cfg(test)]
+#[test]
+#[ignore]
+fn chiptune_wav() {
+    let Ok(path) = std::env::var("PLATOMON_WAV") else { return };
+    std::fs::write(path, wav(&render(44_100.0), 44_100)).unwrap();
+}
+
+#[cfg(test)]
+mod file_tests {
+    use super::*;
+
+    #[test]
+    fn wav_header_and_window() {
+        let tune: Vec<f32> = (0..1000).map(|i| i as f32 / 1000.0).collect();
+        let w = wav(&tune, 8_000);
+        assert_eq!(&w[..4], b"RIFF");
+        assert_eq!(&w[8..16], b"WAVEfmt ");
+        assert_eq!(w.len(), 44 + 2000);
+        assert_eq!(u32::from_le_bytes(w[24..28].try_into().unwrap()), 8_000);
+        let mut out = Vec::new();
+        // 0.05 s at 8 kHz = sample 400: the window ends just before it.
+        window_at(&tune, 8_000.0, 0.05, 4, &mut out);
+        assert_eq!(out, [0.396, 0.397, 0.398, 0.399]);
+        // Near the start it wraps round to the loop's end.
+        window_at(&tune, 8_000.0, 0.0, 2, &mut out);
+        assert_eq!(out, [0.998, 0.999]);
+        window_at(&tune, 8_000.0, f64::NAN, 3, &mut out);
+        assert_eq!(out, [0.0; 3]);
+    }
 }
