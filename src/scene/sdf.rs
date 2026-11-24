@@ -95,6 +95,13 @@ impl SolidKind {
     }
 
     /// Expected (faces, vertices).
+    /// How complex the solid is: its edge count (faces + vertices − 2), the
+    /// face count breaking ties. Orders solids simple to complex.
+    pub fn complexity(self) -> f32 {
+        let (f, v) = self.counts();
+        (f + v - 2) as f32 * (1.0 + f as f32 / 1000.0)
+    }
+
     pub fn counts(self) -> (usize, usize) {
         match self {
             SolidKind::Tetrahedron => (4, 4),
@@ -381,9 +388,15 @@ impl Polyhedron {
     }
 }
 
-/// Rotation R = Ry(yaw) · Rx(pitch); returns R⁻¹ = Rᵀ.
+/// The solids' own model frame in world axes. The polyhedra keep their
+/// standard coordinates, set up with y up; the world has z up, so the model
+/// is turned a quarter turn about x (model y → world z, model z → world −y).
+pub const MODEL_TO_WORLD: Mat3A = Mat3A::from_cols(Vec3A::X, Vec3A::Z, Vec3A::NEG_Y);
+
+/// The solid's rotation R = Rz(yaw) · Rx(pitch) · [`MODEL_TO_WORLD`] (yaw
+/// about the vertical axis); returns R⁻¹ = Rᵀ, world to model.
 pub fn inverse_rotation(pitch: f32, yaw: f32) -> Mat3A {
-    (Mat3A::from_rotation_y(yaw) * Mat3A::from_rotation_x(pitch)).transpose()
+    (Mat3A::from_rotation_z(yaw) * Mat3A::from_rotation_x(pitch) * MODEL_TO_WORLD).transpose()
 }
 
 #[cfg(test)]
@@ -508,7 +521,10 @@ mod tests {
     #[test]
     fn inverse_rotation_is_inverse() {
         let inv = inverse_rotation(0.7, -1.3);
-        let r = Mat3A::from_rotation_y(-1.3) * Mat3A::from_rotation_x(0.7);
+        let r = Mat3A::from_rotation_z(-1.3) * Mat3A::from_rotation_x(0.7) * MODEL_TO_WORLD;
         assert!((inv * r).abs_diff_eq(Mat3A::IDENTITY, 1e-5));
+        // unturned, the model's y axis is the world's vertical
+        assert!((inverse_rotation(0.0, 0.0).transpose() * Vec3A::Y).abs_diff_eq(Vec3A::Z, 1e-6));
+        assert_eq!(MODEL_TO_WORLD.determinant(), 1.0, "a rotation, not a mirror");
     }
 }

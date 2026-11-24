@@ -47,6 +47,40 @@ impl ColorBy {
     }
 }
 
+/// What the sound halo's colour comes from (with a colour gradient on).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum HaloColor {
+    /// Whatever it passes over: the solid or background under each cell.
+    #[default]
+    Under,
+    /// Its own solid's colour, wherever it is drawn.
+    Solid,
+    /// Its size: quiet (small) at the gradient's start, loud (large) at
+    /// its end; per solid with the frequency gradient on.
+    Size,
+    /// The bass level (which also sets its brightness).
+    Bass,
+}
+
+impl HaloColor {
+    pub const ALL: [HaloColor; 4] = [HaloColor::Under, HaloColor::Solid, HaloColor::Size, HaloColor::Bass];
+
+    pub fn id(self) -> &'static str {
+        match self {
+            HaloColor::Under => "under",
+            HaloColor::Solid => "solid",
+            HaloColor::Size => "size",
+            HaloColor::Bass => "bass",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        let s = s.trim().to_ascii_lowercase();
+        Self::ALL.into_iter().find(|h| h.id() == s)
+    }
+}
+
 impl FromStr for ColorBy {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, String> {
@@ -469,6 +503,18 @@ impl ColorMap {
     #[inline]
     pub fn bg_color(&self, l: f32) -> u32 {
         self.bg.as_ref().map_or(NONE, |p| p.at(l))
+    }
+
+    /// Colour for position `v` (0..=1) along the gradient, shaded for glyph
+    /// bucket `bucket` of `buckets` where the palette has shades: the
+    /// solids' palette, else the background's.
+    #[inline]
+    pub fn value_color(&self, v: f32, bucket: usize, buckets: usize) -> u32 {
+        match self.solid.as_ref().or(self.bg.as_ref()) {
+            None => NONE,
+            Some(p) if p.shades() > 1 => p.shade_row(v)[bucket * p.shades() / buckets.max(1)],
+            Some(p) => p.at(v),
+        }
     }
 
     /// A solid's legend/icon colour: its value's brightest shade, or the

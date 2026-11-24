@@ -82,7 +82,7 @@ pub struct ShadowGrid {
     /// not above some solid).
     all: bool,
     x0: f32,
-    z0: f32,
+    y0: f32,
     inv_cell: (f32, f32),
     cells: Vec<u64>,
 }
@@ -91,14 +91,14 @@ impl ShadowGrid {
     /// Cells per axis.
     pub const N: usize = 128;
 
-    /// The solids that can shadow ground point (x, z) (bit `i` = solid `i`).
+    /// The solids that can shadow ground point (x, y) (bit `i` = solid `i`).
     #[inline(always)]
-    pub fn at(&self, x: f32, z: f32) -> u64 {
+    pub fn at(&self, x: f32, y: f32) -> u64 {
         if self.all {
             return ALL_SOLIDS;
         }
         let u = (x - self.x0) * self.inv_cell.0;
-        let v = (z - self.z0) * self.inv_cell.1;
+        let v = (y - self.y0) * self.inv_cell.1;
         // Outside every shadow footprint (or NaN): nothing can shadow it.
         if !(u >= 0.0 && v >= 0.0 && u < Self::N as f32 && v < Self::N as f32) {
             return 0;
@@ -116,46 +116,46 @@ impl ShadowGrid {
             return;
         }
         let (l, rl) = (scene.light.center, scene.light.radius);
-        // Each solid's shadow footprint on y = 0 as an (x0, z0, x1, z1) box.
+        // Each solid's shadow footprint on z = 0 as an (x0, y0, x1, y1) box.
         let mut boxes = Vec::with_capacity(scene.solids.len());
         for s in &scene.solids {
             let r = s.scale + PAD;
-            let top = s.center.y + r;
+            let top = s.center.z + r;
             // Shadow rays leave just above the ground and only the part of a
-            // solid inside the slab y ≥ 0 can block them.
-            let bottom = (s.center.y - r).max(0.0);
-            let lo_light = l.y - rl;
+            // solid inside the slab z ≥ 0 can block them.
+            let bottom = (s.center.z - r).max(0.0);
+            let lo_light = l.z - rl;
             if lo_light <= top + 1e-3 {
                 // The light is not above this solid: no bounded footprint.
                 self.all = true;
                 return;
             }
             // A ray from light point x through solid point y meets the ground
-            // at x + k (y − x), k = x.y / (x.y − y.y) ≥ 1; horizontally that is
+            // at x + k (y − x), k = x.z / (x.z − y.z) ≥ 1; horizontally that is
             // within (k − 1)·R + k·r of L + k (c − L).
-            let k_min = (l.y + rl) / (l.y + rl - bottom);
+            let k_min = (l.z + rl) / (l.z + rl - bottom);
             let k_max = lo_light / (lo_light - top);
             let rad = (k_max - 1.0) * rl + k_max * r + 0.05;
             let (a, b) = (l + (s.center - l) * k_min, l + (s.center - l) * k_max);
-            boxes.push((a.x.min(b.x) - rad, a.z.min(b.z) - rad, a.x.max(b.x) + rad, a.z.max(b.z) + rad));
+            boxes.push((a.x.min(b.x) - rad, a.y.min(b.y) - rad, a.x.max(b.x) + rad, a.y.max(b.y) + rad));
         }
         let Some(&first) = boxes.first() else { return };
-        let (x0, z0, x1, z1) = boxes
+        let (x0, y0, x1, y1) = boxes
             .iter()
             .fold(first, |u, b| (u.0.min(b.0), u.1.min(b.1), u.2.max(b.2), u.3.max(b.3)));
-        if !(x0.is_finite() && z0.is_finite() && x1.is_finite() && z1.is_finite()) {
+        if !(x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite()) {
             self.all = true;
             return;
         }
         let n = Self::N as f32;
         self.x0 = x0;
-        self.z0 = z0;
-        self.inv_cell = (n / (x1 - x0).max(1e-3), n / (z1 - z0).max(1e-3));
+        self.y0 = y0;
+        self.inv_cell = (n / (x1 - x0).max(1e-3), n / (y1 - y0).max(1e-3));
         let cell = |v: f32, o: f32, inv: f32| (((v - o) * inv).max(0.0) as usize).min(Self::N - 1);
         for (i, b) in boxes.iter().enumerate() {
             let bit = 1u64 << i;
             let (u0, u1) = (cell(b.0, x0, self.inv_cell.0), cell(b.2, x0, self.inv_cell.0));
-            let (v0, v1) = (cell(b.1, z0, self.inv_cell.1), cell(b.3, z0, self.inv_cell.1));
+            let (v0, v1) = (cell(b.1, y0, self.inv_cell.1), cell(b.3, y0, self.inv_cell.1));
             for v in v0..=v1 {
                 for m in &mut self.cells[v * Self::N + u0..=v * Self::N + u1] {
                     *m |= bit;
@@ -198,16 +198,16 @@ mod tests {
         let l = scene.light;
         let mut shadowed = 0;
         for _ in 0..50_000 {
-            let p = Vec3A::new(rng.f32() * 30.0 - 15.0, 2e-3, rng.f32() * 30.0 - 15.0) + scene.centroid * Vec3A::new(1.0, 0.0, 1.0);
+            let p = Vec3A::new(rng.f32() * 30.0 - 15.0, rng.f32() * 30.0 - 15.0, 2e-3) + scene.centroid * Vec3A::new(1.0, 1.0, 0.0);
             // a random point on the light
             let q = l.center + Vec3A::new(rng.f32() - 0.5, rng.f32() - 0.5, rng.f32() - 0.5).normalize_or_zero() * (l.radius * rng.f32());
             let to = q - p;
             let (d, dir) = (to.length(), to.normalize());
             let full = march_solids(&scene, p, dir, 0.0, d, 64);
-            let m = g.at(p.x, p.z);
+            let m = g.at(p.x, p.y);
             if let Some(hit) = full {
                 shadowed += 1;
-                assert!(m & (1 << hit.id) != 0, "ground ({}, {}) shadowed by solid {} not in its cell", p.x, p.z, hit.id);
+                assert!(m & (1 << hit.id) != 0, "ground ({}, {}) shadowed by solid {} not in its cell", p.x, p.y, hit.id);
             }
             assert_eq!(march_solids_in(&scene, p, dir, 0.0, d, 64, m), full);
         }
@@ -215,8 +215,8 @@ mod tests {
         // most of the ground needs no shadow test at all
         let free = (0..10_000)
             .filter(|_| {
-                let p = scene.centroid + Vec3A::new(rng.f32() * 40.0 - 20.0, 0.0, rng.f32() * 40.0 - 20.0);
-                g.at(p.x, p.z) == 0
+                let p = scene.centroid + Vec3A::new(rng.f32() * 40.0 - 20.0, rng.f32() * 40.0 - 20.0, 0.0);
+                g.at(p.x, p.y) == 0
             })
             .count();
         assert!(free > 5_000, "{free} of 10000 ground points skip the shadow test");

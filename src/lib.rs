@@ -10,6 +10,7 @@ pub mod clock;
 pub mod color;
 pub mod collector;
 pub mod config;
+pub mod drive;
 pub mod metrics;
 pub mod overlay;
 pub mod render;

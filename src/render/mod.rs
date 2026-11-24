@@ -57,6 +57,12 @@ impl Projection {
         Self { cam, k, half_w: w as f32 * 0.5, half_h: h as f32 * 0.5, aspect }
     }
 
+    /// The angle a pixel spans, radians (its taller side: cells are taller
+    /// than wide), for [`TraceSettings::pixel_angle`].
+    pub fn pixel_angle(&self) -> f32 {
+        self.k * (1.0 / self.aspect).max(1.0)
+    }
+
     /// Unit ray direction through continuous pixel position `(x, y)`.
     #[inline(always)]
     pub fn ray(&self, x: f32, y: f32) -> Vec3A {
@@ -132,7 +138,7 @@ impl Renderer {
         let spp = rs.spp.max(1);
         let inv_spp = 1.0 / spp as f32;
         let frame = self.frame;
-        let ts = rs.trace;
+        let ts = TraceSettings { pixel_angle: proj.pixel_angle(), ..rs.trace };
         let tx = lut::tile_masks(scene, &proj, w, h, &mut self.tiles);
         let tiles = &self.tiles;
         self.shadows.build(scene);

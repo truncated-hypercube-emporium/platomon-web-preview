@@ -51,12 +51,19 @@ gets brighter with the bass. *By frequency* (default) gives each solid its own s
 FFT: the simplest solid in the scene hears the bass, the most complex the treble. *Colour by: sound* colours
 each solid by the loudness of its own band (the desktop program has no sound meter). The halo is redrawn
 on its own between full frames, up to the frame-rate cap. Sources: **simulated music** (default; a
-built-in 120 bpm track whose sections favour bass, mids or treble in turn), **microphone**, or
-**tab / system audio** (screen-share picker: tick *Share audio*; system audio is offered on Windows
-and ChromeOS). Capture needs the https page and stays in the browser.
+silent built-in 120 bpm track whose sections favour bass, mids or treble in turn), **microphone**
+(needs the https page; the audio stays in the browser), or **chiptune**: a 16-bar loop in A minor at
+150 bpm (25.6 s) in 8-bit style (pulse-wave lead with vibrato, pulse arpeggio, 4-bit triangle bass,
+noise drums), played aloud with its own volume slider and analysed as it plays, so the halo follows
+what you hear. *Halo colour* picks what colours the halo: what it passes over, its solid, its size or
+the bass.
 
-Colour gradients are drawn as coloured text; with `256` depth the page shows the xterm palette entry a
-256-colour terminal would use.
+Tags have a position (circle, beside, corner, below, trailing); with block letters the web preview
+also offers 1-3x size and six fonts. *Per-solid inputs* replaces the metrics table with up to 12
+`SHAPE|SIZE|SPIN|COLOUR|COMPLEXITY` bindings separated by `;` (desktop: `--bind`). Floor patterns
+show only their own sliders. The **Settings** button rides on the panel's top-left corner.
+
+Colour gradients are drawn as coloured text.
 The simulated machine has adapters `Ethernet`, `Wi-Fi`, `vEthernet` and disks `C:\`, `D:\`, `E:\`.
 Browsers cap drawing at the display's refresh rate and throttle hidden tabs.
 

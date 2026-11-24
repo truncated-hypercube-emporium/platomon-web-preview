@@ -13,6 +13,7 @@
 //! frames the page calls [`halo_frame`] at the display rate, which redraws
 //! only the halo over the last rendered picture.
 
+pub mod chiptune;
 pub mod sound;
 
 use std::cell::RefCell;
@@ -23,8 +24,9 @@ use platomon::aspect::{self, AspectMode, Viewport};
 use platomon::clock::{activity_to_fps, slew_limit};
 use platomon::color::{self, ColorBy, ColorMap};
 use platomon::config::{Config, SlotSpec};
-use platomon::metrics::{MetricsState, activity_score};
-use platomon::overlay::{HALO_SWINGS, Halo, OverlayOptions, Overlays};
+use platomon::drive::Drives;
+use platomon::metrics::{MetricsState, Reading, activity_score};
+use platomon::overlay::{HALO_SWINGS, Halo, OverlayOptions, Overlays, TagFont};
 use platomon::render::{QualityGovernor, RenderSettings, Renderer, TraceSettings};
 use platomon::scene::camera::CameraParams;
 use platomon::scene::{AnimParams, Ground, Scene, SlotLayout};
@@ -40,6 +42,11 @@ pub struct App {
     anim: AnimParams,
     scene: Scene,
     metrics: MetricsState,
+    /// Each solid's inputs (size, spin, colour, complexity) over the metrics.
+    drives: Drives,
+    /// Web-only tag style: block-letter scale with `tag_blocks` (1..=3) and font.
+    tag_scale: u8,
+    tag_font: TagFont,
     weights: Vec<f32>,
     renderer: Renderer,
     governor: QualityGovernor,
@@ -159,17 +166,20 @@ impl App {
     pub fn new(cfg: Config, slots: Vec<SlotSpec>, ratio: Option<f32>, sim: Sim) -> Self {
         let anim = anim_params(&cfg);
         let layout: Vec<SlotLayout> = slots.iter().map(|s| SlotLayout { solid: s.solid, ring: s.ring }).collect();
-        let scene =
-            Scene::with_layout(&layout, &anim, &camera_params(&cfg), cfg.layout).with_ground(&cfg.ground_params());
-        let specs: Vec<_> = slots.iter().map(|s| s.metric.clone()).collect();
-        let metrics = MetricsState::new(&cfg, &specs);
-        let weights = metrics.weights(&cfg.weights);
+        let scene = Scene::arranged(&layout, &anim, &camera_params(&cfg), &cfg.arrangement(&slots))
+            .with_ground(&cfg.ground_params());
+        let drives = Drives::new(&SlotSpec::drives(&slots), cfg.delta_period);
+        let metrics = MetricsState::new(&cfg, drives.sources());
+        let weights = drives.weights(&cfg.weights);
         let overlays = Overlays::new(&scene);
         let target = if cfg.fps_invert { cfg.fps_max } else { cfg.fps_min };
         Self {
             anim,
             scene,
             metrics,
+            drives,
+            tag_scale: 1,
+            tag_font: TagFont::Strokes,
             weights,
             renderer: Renderer::new(),
             governor: QualityGovernor::default(),
@@ -223,6 +233,8 @@ impl App {
         c.tags = new.tags;
         c.tag_color = new.tag_color.clone();
         c.tag_blocks = new.tag_blocks;
+        c.tag_place = new.tag_place;
+        c.halo_color = new.halo_color;
         c.color = new.color.clone();
         c.color_by = new.color_by;
         c.color_reverse = new.color_reverse;
@@ -236,12 +248,13 @@ impl App {
         c.idle_spin = new.idle_spin;
         c.max_spin = new.max_spin;
         c.weights = new.weights;
-        self.weights = self.metrics.weights(&c.weights);
+        self.weights = self.drives.weights(&c.weights);
         self.ratio = ratio;
         self.anim = anim_params(c);
         let ground = new.ground_params();
         if ground != c.ground_params() {
-            let pivot = Vec2::new(self.scene.centroid.x, self.scene.centroid.z);
+            // Z-up world: the floor is the x-y plane.
+            let pivot = Vec2::new(self.scene.centroid.x, self.scene.centroid.y);
             self.scene.ground = Ground::new(&ground, pivot);
             c.bg_lum = new.bg_lum;
             c.bg_pattern = new.bg_pattern;
@@ -254,6 +267,22 @@ impl App {
             c.bg_rotate_period = new.bg_rotate_period;
             c.bg_waves = new.bg_waves;
             c.bg_wave_speed = new.bg_wave_speed;
+            c.bg_drops = new.bg_drops;
+            c.bg_ripple = new.bg_ripple;
+            c.bg_drop_life = new.bg_drop_life;
+            c.bg_wind = new.bg_wind;
+            c.bg_chop = new.bg_chop;
+            c.bg_julia_iter = new.bg_julia_iter;
+            c.bg_julia_shape = new.bg_julia_shape;
+            c.bg_carpet_levels = new.bg_carpet_levels;
+            c.bg_octaves = new.bg_octaves;
+            c.bg_roughness = new.bg_roughness;
+            c.bg_sectors = new.bg_sectors;
+            c.bg_dot_size = new.bg_dot_size;
+            c.bg_dot_spacing = new.bg_dot_spacing;
+            c.bg_dot_variability = new.bg_dot_variability;
+            c.bg_invert_half = new.bg_invert_half;
+            debug_assert_eq!(c.ground_params(), ground, "every ground setting copied");
         }
         self.target = self.target.clamp(c.fps_min, c.fps_max);
         // Halo-only frames wait for a full frame with the new settings.
@@ -263,6 +292,21 @@ impl App {
     /// Sound halo settings (see [`set_sound`]).
     pub fn set_sound(&mut self, source: Source, swing: f32, bands: bool) {
         self.sound.configure(source, swing, bands, &self.scene);
+    }
+
+    /// Block-letter tag size (1..=3, with `tag_blocks`) and font (index into
+    /// [`TagFont::ALL`]-like order: strokes, hash, dots, stars, at, bricks).
+    pub fn set_tag_style(&mut self, scale: u8, font: u32) {
+        self.tag_scale = scale.clamp(1, 3);
+        self.tag_font = match font {
+            1 => TagFont::Hash,
+            2 => TagFont::Dots,
+            3 => TagFont::Stars,
+            4 => TagFont::At,
+            5 => TagFont::Bricks,
+            _ => TagFont::Strokes,
+        };
+        self.last = None;
     }
 
     pub fn sound(&self) -> &SoundHalo {
@@ -292,12 +336,16 @@ impl App {
             self.since_sample = 0.0;
         }
         self.metrics.tick(dt);
-        let channels = self.metrics.channels();
-        self.activity = activity_score(&channels, &self.weights);
+        self.drives.tick(&self.metrics, dt);
+        for (i, k) in self.drives.shapes().enumerate() {
+            self.scene.set_kind(i, k);
+        }
+        let channels = self.drives.channels();
+        self.activity = activity_score(channels, &self.weights);
         let a = if self.cfg.fps_invert { 1.0 - self.activity } else { self.activity };
         let want = activity_to_fps(a, self.cfg.fps_min, self.cfg.fps_max, self.cfg.fps_curve);
         self.target = slew_limit(self.target, want, self.cfg.fps_slew, dt).clamp(self.cfg.fps_min, self.cfg.fps_max);
-        self.scene.update(&channels, &self.anim, dt);
+        self.scene.update(channels, &self.anim, dt);
         // Sound first: its per-solid bands are the colour values for
         // `color_by = "sound"`.
         let halo = self.sound.next((dt - std::mem::take(&mut self.halo_time)).max(0.0));
@@ -306,7 +354,7 @@ impl App {
             self.levels.extend_from_slice(self.sound.colour_levels());
             self.levels.resize(self.scene.solids.len(), 0.0);
         } else {
-            self.scene.color_values(self.cfg.color_by, &channels, &mut self.levels);
+            self.scene.color_values(self.cfg.color_by, self.drives.color_channels(), &mut self.levels);
         }
 
         let area_h = rows.saturating_sub(self.cfg.show_stats as usize);
@@ -330,14 +378,16 @@ impl App {
         self.renderer.render(&self.scene, vp.w, vp.h, &rs);
 
         let readings = self.metrics.readings();
+        // Legend and tags: one reading per solid (its first input).
+        let per_solid: Vec<&Reading> = self.drives.readings(&self.metrics).into_iter().flatten().collect();
         if self.cfg.legend {
             self.labels.clear();
             let block = self.cfg.legend_size >= 3;
-            self.labels.extend(readings.iter().map(|r| if block { ui::short_label(r) } else { ui::segment(r) }));
+            self.labels.extend(per_solid.iter().map(|r| if block { ui::short_label(r) } else { ui::segment(r) }));
         }
         if self.cfg.tags {
             self.tag_labels.clear();
-            self.tag_labels.extend(readings.iter().map(|r| ui::short_label(r)));
+            self.tag_labels.extend(per_solid.iter().map(|r| ui::short_label(r)));
         }
         let ramp = Ramp::new(&self.cfg.ramp);
         let legend = self.cfg.legend_params();
@@ -355,7 +405,10 @@ impl App {
             tags: self.cfg.tags,
             tag_labels: &self.tag_labels,
             tag_ink: self.cfg.tag_ink(self.cmap.as_ref()),
-            tag_blocks: self.cfg.tag_blocks,
+            halo_color: self.cfg.halo_color,
+            tag_scale: if self.cfg.tag_blocks { self.tag_scale } else { 0 },
+            tag_place: self.cfg.tag_place,
+            tag_font: self.tag_font,
             tag_fixed: self.cfg.tag_fixed_len,
         };
         self.pic_chars.clear();
@@ -417,7 +470,10 @@ impl App {
             tags: self.cfg.tags,
             tag_labels: &self.tag_labels,
             tag_ink: self.cfg.tag_ink(self.cmap.as_ref()),
-            tag_blocks: self.cfg.tag_blocks,
+            halo_color: self.cfg.halo_color,
+            tag_scale: if self.cfg.tag_blocks { self.tag_scale } else { 0 },
+            tag_place: self.cfg.tag_place,
+            tag_font: self.tag_font,
             tag_fixed: self.cfg.tag_fixed_len,
         };
         let view = self.renderer.view()?;
@@ -481,6 +537,10 @@ struct Host {
     sim: Sim,
     /// Sound settings, kept across restarts: source, halo swing, bands.
     sound: (Source, f32, bool),
+    /// The rendered chiptune loop, until the page has copied it.
+    tune: Vec<f32>,
+    /// Tag block scale and font, kept across restarts.
+    tag_style: (u8, u32),
     /// Samples written by the page (see [`audio_buffer`]).
     audio: Vec<f32>,
 }
@@ -516,6 +576,8 @@ pub extern "C" fn configure(len: usize, restart: u32) -> u32 {
                         let mut app = App::new(cfg, slots, ratio, sim);
                         let (src, wide, bands) = h.sound;
                         app.set_sound(src, wide, bands);
+                        let (scale, font) = h.tag_style;
+                        app.set_tag_style(scale, font);
                         h.app = Some(app);
                     }
                 }
@@ -564,6 +626,38 @@ pub extern "C" fn set_sound(source: u32, swing: u32, bands: u32) {
             app.set_sound(h.sound.0, h.sound.1, h.sound.2);
         }
     })
+}
+
+/// Tag style: block-letter `scale` 1..=3 (used with `tag_blocks`) and `font`
+/// 0 strokes, 1 hash, 2 dots, 3 stars, 4 at, 5 bricks.
+#[unsafe(no_mangle)]
+pub extern "C" fn set_tag_style(scale: u32, font: u32) {
+    HOST.with_borrow_mut(|h| {
+        h.tag_style = (scale.clamp(1, 3) as u8, font);
+        if let Some(app) = h.app.as_mut() {
+            app.set_tag_style(h.tag_style.0, font);
+        }
+    })
+}
+
+/// Render the [`chiptune`] loop at `rate` Hz; returns its length in samples
+/// (read them at [`chiptune_ptr`], then call [`chiptune_free`]).
+#[unsafe(no_mangle)]
+pub extern "C" fn chiptune_render(rate: f32) -> usize {
+    HOST.with_borrow_mut(|h| {
+        h.tune = chiptune::render(rate);
+        h.tune.len()
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn chiptune_ptr() -> *const f32 {
+    HOST.with_borrow(|h| h.tune.as_ptr())
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn chiptune_free() {
+    HOST.with_borrow_mut(|h| h.tune = Vec::new())
 }
 
 /// Reserve room for `len` f32 samples for [`audio_push`]; returns the address.

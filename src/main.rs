@@ -11,13 +11,14 @@ use platomon::clock::{self, FrameClock, SPIN_MARGIN};
 use platomon::color::{self, ColorBy, ColorMap, Gradient};
 use platomon::collector::{Collector, gpu::GpuSampler, system::SystemSampler};
 use platomon::config::{Config, SlotSpec, split_assignment};
+use platomon::drive::Drives;
 use platomon::metrics::{Channel, MetricKind, MetricsState, Reading, activity_score};
-use platomon::overlay::{LegendPos, OverlayOptions, Overlays};
+use platomon::overlay::{LegendPos, OverlayOptions, Overlays, TagPlace};
 use platomon::render::{QualityGovernor, RenderSettings, Renderer, TraceSettings};
 use platomon::scene::camera::{CameraMode, CameraParams, OrbitDir};
 use platomon::scene::ground::{Pattern, Spin, parse_vec2};
 use platomon::scene::sdf::{Polyhedron, SolidKind};
-use platomon::scene::{AnimParams, Layout, Scene, SlotLayout};
+use platomon::scene::{AnimParams, Layout, OrbitCenter, Ordering, Scene, SlotLayout};
 use platomon::ui::{self, Action};
 
 /// Longest sleep between input polls while waiting for a frame deadline.
@@ -72,6 +73,15 @@ struct Cli {
     /// Ring for a metric, 0 = innermost (repeatable).
     #[arg(long, value_name = "METRIC=N")]
     ring: Vec<String>,
+    /// One solid with its own inputs (repeatable, max 12; replaces --show):
+    /// SHAPE|SIZE|SPIN|COLOUR|COMPLEXITY, e.g. "auto|cpu|delta:ram|cpu|off".
+    /// SHAPE is a solid or auto; each input a metric, delta:METRIC (its change
+    /// over --delta-period) or off.
+    #[arg(long, value_name = "SHAPE|SIZE|SPIN|COLOUR|COMPLEXITY")]
+    bind: Vec<String>,
+    /// Seconds a delta input measures the change over (1..600).
+    #[arg(long, value_name = "SECS")]
+    delta_period: Option<f32>,
 
     // ---- rendering
     /// Samples per pixel.
@@ -121,9 +131,14 @@ struct Cli {
     /// Draw tag text as three-row block letters, easier to read on small fonts.
     #[arg(long)]
     tag_blocks: bool,
-    /// Fixed tag length: leader lines keep one length, growing only to keep tags off other solids.
+    /// Fixed tag length (beside, below and trailing tags): leader lines keep one length,
+    /// growing only to keep tags off other solids.
     #[arg(long)]
     tag_fixed_length: bool,
+    /// Where tags go: circle (round the picture's centre, nearest each solid), beside,
+    /// corner (stacked in the picture's corners), below or trailing (behind moving solids).
+    #[arg(long, value_name = "circle|beside|corner|below|trailing")]
+    tag_place: Option<TagPlace>,
     /// Extended floor: draw the ground plane 8x further out (shaded cheaply past the normal distance).
     #[arg(long)]
     far_ground: bool,
@@ -146,9 +161,41 @@ struct Cli {
     color_reverse: bool,
 
     // ---- layout
-    /// rings (on the ground) or sphere (concentric spherical shells; --ring picks the shell).
-    #[arg(long, value_name = "rings|sphere")]
+    /// rings (on the ground), sphere (concentric spherical shells; --ring picks the shell),
+    /// line (one evenly spaced row), stack (one above another in the centre) or orbit
+    /// (one solid in the centre, the others on orbits around it).
+    #[arg(long, value_name = "rings|sphere|line|stack|orbit")]
     layout: Option<Layout>,
+    /// Orbit layout: the solid in the centre, cpu, ram, net, disk, size (the largest at the
+    /// moment) or spin (the fastest).
+    #[arg(long, value_name = "cpu|ram|net|disk|size|spin")]
+    orbit_center: Option<OrbitCenter>,
+    /// Orbit layout: angular speed of the innermost orbit, radians/s, 0.05..2 (default 0.35).
+    #[arg(long, value_name = "RAD/S")]
+    orbit_velocity: Option<f32>,
+    /// Orbit layout: tilt of the orbits, degrees, 0..90 (default 15).
+    #[arg(long, value_name = "DEG")]
+    orbit_inclination: Option<f32>,
+    /// Orbit layout: 0 = circles, up to 0.8 = long ellipses (default 0.15).
+    #[arg(long, value_name = "0..0.8")]
+    orbit_eccentricity: Option<f32>,
+    /// Orbit layout: how much each orbit's size step, speed, tilt, shape and direction
+    /// differ from the others, 0..1 (default 0.3).
+    #[arg(long, value_name = "0..1")]
+    orbit_variation: Option<f32>,
+    /// Which solid takes which place: listed (metric order), simple (simplest first),
+    /// complex (most complex first) or random.
+    #[arg(long, value_name = "listed|simple|complex|random")]
+    ordering: Option<Ordering>,
+    /// Neighbour spacing as a multiple of the standard, 0.25..4 (default 1); orbits are
+    /// 10% x this of their radius apart.
+    #[arg(long, value_name = "FLOAT")]
+    spacing: Option<f32>,
+    /// Distance scaling, -2..2: each solid's size times 1 + N x (its nearest neighbour's
+    /// distance / the standard spacing - 1); positive grows isolated solids, negative shrinks
+    /// them (default 0 = off).
+    #[arg(long, value_name = "-2..2", allow_hyphen_values = true)]
+    distance_scale: Option<f32>,
 
     // ---- display ratio
     /// Picture ratio: fill, a preset (vga, wxga, fhd, uwqhd, ... see --list aspects) or W:H.
@@ -203,8 +250,8 @@ struct Cli {
     /// Tile size in world units (a full-size solid is 2 across).
     #[arg(long, value_name = "FLOAT")]
     bg_scale: Option<f32>,
-    /// Constant pattern translation, world units/s, e.g. 0.5:0 or -0.2:0.3.
-    #[arg(long, value_name = "DX:DZ", allow_hyphen_values = true)]
+    /// Constant pattern translation across the floor (x, y), world units/s, e.g. 0.5:0 or -0.2:0.3.
+    #[arg(long, value_name = "DX:DY", allow_hyphen_values = true)]
     bg_scroll: Option<String>,
     /// Radius of a circular back-and-forth translation; 0 = off.
     #[arg(long, value_name = "FLOAT")]
@@ -221,9 +268,55 @@ struct Cli {
     /// Quasicrystal background: number of plane waves, 3..24 (its rotational symmetry; default 7).
     #[arg(long, value_name = "N")]
     bg_waves: Option<u32>,
-    /// Quasicrystal background: wave phase speed in radians/s; 0 = still, negative = reverse (default 0.6).
+    /// Animated backgrounds' flow: the quasicrystal's wave phase speed in radians/s (0 = still,
+    /// negative = reverse; default 0.6); rain, ocean, julia and clouds move in proportion.
     #[arg(long, value_name = "RAD/S", allow_hyphen_values = true)]
     bg_wave_speed: Option<f32>,
+    /// Rain background: raindrops rippling at once, 1..48 (default 12).
+    #[arg(long, value_name = "N")]
+    bg_drops: Option<u32>,
+    /// Rain background: distance between ripples, tiles (default 0.9).
+    #[arg(long, value_name = "TILES")]
+    bg_ripple: Option<f32>,
+    /// Rain background: seconds a drop's rings last (default 4.5).
+    #[arg(long, value_name = "SECS")]
+    bg_drop_life: Option<f32>,
+    /// Ocean background: wind direction, degrees (default 30).
+    #[arg(long, value_name = "DEG")]
+    bg_wind: Option<f32>,
+    /// Ocean background: crest sharpness, 0 = plain sine waves (default 0.6).
+    #[arg(long, value_name = "FLOAT")]
+    bg_chop: Option<f32>,
+    /// Julia background: iterations, more = finer edge detail (default 28).
+    #[arg(long, value_name = "N")]
+    bg_julia_iter: Option<u32>,
+    /// Julia background: radius of the circle its constant drifts round (default 0.7885).
+    #[arg(long, value_name = "FLOAT")]
+    bg_julia_shape: Option<f32>,
+    /// Carpet background: scales the squares are cut out at (default 5).
+    #[arg(long, value_name = "N")]
+    bg_carpet_levels: Option<u32>,
+    /// Clouds background: octaves of noise (default 5).
+    #[arg(long, value_name = "N")]
+    bg_octaves: Option<u32>,
+    /// Clouds background: each finer octave's strength, 0.1..0.9 (default 0.5).
+    #[arg(long, value_name = "FLOAT")]
+    bg_roughness: Option<f32>,
+    /// Radial background: sectors round the focal point (default 12).
+    #[arg(long, value_name = "N")]
+    bg_sectors: Option<u32>,
+    /// Polka background: each dot's size across, tiles (default 0.5).
+    #[arg(long, value_name = "TILES")]
+    bg_dot_size: Option<f32>,
+    /// Polka background: distance between neighbouring dots, tiles (default 1).
+    #[arg(long, value_name = "TILES")]
+    bg_dot_spacing: Option<f32>,
+    /// Polka background: how much dot sizes and places vary, 0..1 (default 0).
+    #[arg(long, value_name = "FLOAT")]
+    bg_dot_variability: Option<f32>,
+    /// Polka background: invert the dots on one side of a line through the centre.
+    #[arg(long)]
+    bg_invert_half: bool,
 }
 
 fn fail(msg: impl std::fmt::Display) -> ! {
@@ -236,9 +329,12 @@ fn apply_cli(cfg: &mut Config, cli: &Cli) -> Result<(), String> {
         ($($f:ident),*) => { $( if let Some(v) = cli.$f.clone() { cfg.$f = v; } )* };
     }
     set!(spp, bounces, fps_min, fps_max, ramp, char_aspect, aspect, aspect_mode, camera, orbit_period, orbit_dir, orbit_bob);
-    set!(bg_lum, bg_pattern, bg_contrast, bg_scale, bg_sway, bg_sway_period, bg_rotate, bg_rotate_period, bg_waves, bg_wave_speed);
-    set!(legend_size, legend_opacity, legend_pos);
-    set!(color, color_by, bg_color, layout, focus_zoom, focus_tau);
+    set!(bg_lum, bg_pattern, bg_contrast, bg_scale, bg_sway, bg_sway_period, bg_rotate, bg_rotate_period, bg_waves, bg_wave_speed, bg_drops);
+    set!(bg_ripple, bg_drop_life, bg_wind, bg_chop, bg_julia_iter, bg_julia_shape, bg_carpet_levels, bg_octaves, bg_roughness, bg_sectors);
+    set!(bg_dot_size, bg_dot_spacing, bg_dot_variability);
+    set!(legend_size, legend_opacity, legend_pos, tag_place);
+    set!(color, color_by, bg_color, layout, ordering, spacing, focus_zoom, focus_tau);
+    set!(distance_scale, orbit_center, orbit_velocity, orbit_inclination, orbit_eccentricity, orbit_variation);
     if let Some(n) = &cli.colors {
         cfg.colors = n.parse().unwrap_or(color::DEFAULT_COLORS);
     }
@@ -253,6 +349,9 @@ fn apply_cli(cfg: &mut Config, cli: &Cli) -> Result<(), String> {
     }
     if cli.tag_fixed_length {
         cfg.tag_fixed_len = true;
+    }
+    if cli.bg_invert_half {
+        cfg.bg_invert_half = true;
     }
     if cli.far_ground {
         cfg.far_ground = true;
@@ -306,6 +405,12 @@ fn apply_cli(cfg: &mut Config, cli: &Cli) -> Result<(), String> {
             return Err(format!("--ring {a}: ring must be 0..=15"));
         }
         cfg.rings.insert(k, n);
+    }
+    if !cli.bind.is_empty() {
+        cfg.bindings = cli.bind.iter().map(|s| s.trim().to_string()).collect();
+    }
+    if let Some(p) = cli.delta_period {
+        cfg.delta_period = p;
     }
     if cli.stats {
         cfg.show_stats = true;
@@ -455,7 +560,7 @@ fn camera_params(cfg: &Config) -> CameraParams {
 }
 
 fn build_scene(cfg: &Config, slots: &[SlotSpec]) -> Scene {
-    Scene::with_layout(&layouts(slots), &anim_params(cfg), &camera_params(cfg), cfg.layout)
+    Scene::arranged(&layouts(slots), &anim_params(cfg), &camera_params(cfg), &cfg.arrangement(slots))
         .with_ground(&cfg.ground_params())
 }
 
@@ -512,10 +617,13 @@ fn snapshot(cfg: &Config, slots: &[SlotSpec], ratio: Option<f32>, (w, h): (usize
         },
         halo: None,
         halo_factors: &[],
+        halo_color: cfg.halo_color,
         tags: cfg.tags,
         tag_labels: &labels,
         tag_ink: cfg.tag_ink(cmap.as_ref()),
-        tag_blocks: cfg.tag_blocks,
+        tag_scale: cfg.tag_blocks as u8,
+        tag_place: cfg.tag_place,
+        tag_font: platomon::overlay::TagFont::Strokes,
         tag_fixed: cfg.tag_fixed_len,
     };
     let mut overlays = Overlays::new(&scene);
@@ -705,12 +813,13 @@ fn run(
     let anim = anim_params(cfg);
     let base = render_settings(cfg, ratio);
     let ramp = Ramp::new(&cfg.ramp);
-    let specs: Vec<_> = slots.iter().map(|s| s.metric.clone()).collect();
+    // each solid's inputs, over the distinct metrics they read
+    let mut drives = Drives::new(&SlotSpec::drives(slots), cfg.delta_period);
 
     let mut scene = build_scene(cfg, slots);
-    let mut metrics = MetricsState::new(cfg, &specs);
+    let mut metrics = MetricsState::new(cfg, drives.sources());
     let mut levels: Vec<f32> = Vec::new();
-    let weights = metrics.weights(&cfg.weights);
+    let weights = drives.weights(&cfg.weights);
     let mut fps = FrameClock::new(cfg.fps_min, cfg.fps_max, cfg.fps_curve, cfg.fps_slew).inverted(cfg.fps_invert);
     let mut renderer = Renderer::new();
     let mut governor = QualityGovernor::default();
@@ -774,10 +883,14 @@ fn run(
             metrics.ingest(&raw);
         }
         metrics.tick(dt);
-        let channels = metrics.channels();
-        fps.update_target(activity_score(&channels, &weights), dt);
-        scene.update(&channels, &anim, dt);
-        scene.color_values(cfg.color_by, &channels, &mut levels);
+        drives.tick(&metrics, dt);
+        let channels = drives.channels();
+        fps.update_target(activity_score(channels, &weights), dt);
+        for (i, k) in drives.shapes().enumerate() {
+            scene.set_kind(i, k);
+        }
+        scene.update(channels, &anim, dt);
+        scene.color_values(cfg.color_by, drives.color_channels(), &mut levels);
 
         let area_h = (rows as usize).saturating_sub(show_stats as usize);
         let vp = aspect::viewport(cols as usize, area_h, ratio, cfg.aspect_mode, cfg.char_aspect);
@@ -785,12 +898,13 @@ fn run(
 
         let t0 = Instant::now();
         renderer.render(&scene, vp.w, vp.h, &settings);
-        let readings = metrics.readings();
         let stats_text = show_stats.then(|| {
             let extra = if governor.level() > 0 { format!(" | q-{}", governor.level()) } else { String::new() };
-            ui::stats_line_fit(&readings, fps.achieved_fps(), fps.target_fps(), &extra, cols as usize)
+            ui::stats_line_fit(&metrics.readings(), fps.achieved_fps(), fps.target_fps(), &extra, cols as usize)
         });
         let stats = stats_text.as_deref().map(|text| StatsLine { text, row: area_h, width: cols as usize });
+        // per solid (every solid has at least one input)
+        let readings: Vec<&Reading> = drives.readings(&metrics).into_iter().flatten().collect();
         if show_legend {
             legend_labels(&readings, legend.size, &mut labels);
         }
@@ -809,10 +923,13 @@ fn run(
             levels: &levels,
             halo: None,
             halo_factors: &[],
+            halo_color: cfg.halo_color,
             tags,
             tag_labels: &tag_labels,
             tag_ink,
-            tag_blocks: cfg.tag_blocks,
+            tag_scale: cfg.tag_blocks as u8,
+            tag_place: cfg.tag_place,
+            tag_font: platomon::overlay::TagFont::Strokes,
             tag_fixed: cfg.tag_fixed_len,
         };
         if let Some(view) = renderer.view() {

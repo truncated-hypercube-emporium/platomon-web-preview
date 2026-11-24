@@ -5,6 +5,11 @@ show = [
     "net",
     "gpu",
 ]
+# Per-solid inputs instead of `show` (max 12): "SHAPE|SIZE|SPIN|COLOUR|COMPLEXITY",
+# each input a metric, "delta:METRIC" (its change over delta_period seconds) or "off".
+# bindings = ["auto|cpu", "cube|ram|delta:ram|ram|off", "auto|delta:net|net|net|cpu"]
+bindings = []
+delta_period = 10.0
 fps_min = 5.0
 fps_max = 150.0
 fps_curve = "sqrt"
@@ -54,7 +59,22 @@ bg_sway_period = 10.0
 bg_rotate = "off"
 bg_rotate_period = 60.0
 bg_waves = 7              # quasicrystal: plane waves, 3..24
-bg_wave_speed = 0.6       # quasicrystal: radians/s, 0 = still
+bg_wave_speed = 0.6       # flow of the animated patterns (quasicrystal, radians/s, 0 = still; rain, ocean, julia, clouds in proportion)
+bg_drops = 12             # rain: raindrops rippling at once, 1..48
+bg_ripple = 0.9           # rain: distance between ripples, tiles
+bg_drop_life = 4.5        # rain: seconds a drop's rings last
+bg_wind = 30.0            # ocean: wind direction, degrees
+bg_chop = 0.6             # ocean: crest sharpness, 0 = plain sine waves
+bg_julia_iter = 28        # julia: iterations (edge detail)
+bg_julia_shape = 0.7885   # julia: radius of the circle its constant drifts round
+bg_carpet_levels = 5      # carpet: sizes of square cut out
+bg_octaves = 5            # clouds: noise octaves
+bg_roughness = 0.5        # clouds: each finer octave's strength
+bg_sectors = 12           # radial: sectors round the focal point
+bg_dot_size = 0.5         # polka: dot size across, tiles
+bg_dot_spacing = 1.0      # polka: distance between neighbouring dots, tiles
+bg_dot_variability = 0.0  # polka: how much dot sizes and places vary, 0..1
+bg_invert_half = false    # polka: invert one side of a line through the centre
 min_scale = 0.45
 max_scale = 1.0
 max_spin = 3.0

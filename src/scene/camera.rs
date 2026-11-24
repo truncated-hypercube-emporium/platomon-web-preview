@@ -89,7 +89,7 @@ pub struct Camera {
 impl Camera {
     pub fn look_at(pos: Vec3A, target: Vec3A, hfov_deg: f32, vfov_deg: f32) -> Self {
         let forward = (target - pos).normalize();
-        let right = forward.cross(Vec3A::Y).normalize();
+        let right = forward.cross(Vec3A::Z).normalize();
         let up = right.cross(forward);
         Self { pos, forward, right, up, hfov: hfov_deg.to_radians(), vfov: vfov_deg.to_radians() }
     }
@@ -136,7 +136,7 @@ pub const FOCUS_CLOSE: f32 = 5.0;
 /// Distance and height per unit of layout extent (tuned on the 5-solid ring).
 const RADIUS_PER_EXTENT: f32 = 2.32;
 const HEIGHT_PER_EXTENT: f32 = 1.4;
-const TARGET_Y: f32 = 0.55;
+const TARGET_Z: f32 = 0.55;
 const HFOV_DEG: f32 = 50.0;
 const VFOV_DEG: f32 = 30.0;
 /// Tilt mode: lowest and highest camera elevation above the look-at
@@ -248,12 +248,12 @@ impl CameraRig {
 
     /// Elevation of the overview eye above the look-at point, radians.
     fn overview_elevation(&self) -> f32 {
-        (self.height - TARGET_Y).atan2(self.radius).clamp(0.0, FRAC_PI_2)
+        (self.height - TARGET_Z).atan2(self.radius).clamp(0.0, FRAC_PI_2)
     }
 
     /// Distance of the overview eye from the look-at point.
     fn overview_distance(&self) -> f32 {
-        self.radius.hypot(self.height - TARGET_Y).max(1e-3)
+        self.radius.hypot(self.height - TARGET_Z).max(1e-3)
     }
 
     /// The furthest the eye ever gets from the look-at point, in any mode,
@@ -261,7 +261,7 @@ impl CameraRig {
     /// the overview eye and a solid, so the overview bounds it too.
     pub fn reach(&self) -> f32 {
         let d = match self.mode {
-            CameraMode::Orbit => self.radius.hypot(self.height + self.bob.abs() - TARGET_Y),
+            CameraMode::Orbit => self.radius.hypot(self.height + self.bob.abs() - TARGET_Z),
             CameraMode::Resonance => self.overview_distance() * (1.0 + RESONANCE_BREATH),
             _ => self.overview_distance(),
         };
@@ -270,7 +270,7 @@ impl CameraRig {
 
     /// The point the overview, tilt and resonance cameras look at.
     pub fn target(&self) -> Vec3A {
-        self.centroid + Vec3A::new(0.0, TARGET_Y, 0.0)
+        self.centroid + Vec3A::new(0.0, 0.0, TARGET_Z)
     }
 
     /// Tilt mode: one cycle of arc up, hold, arc down, hold.
@@ -313,14 +313,14 @@ impl CameraRig {
     fn arc_camera(&self) -> Camera {
         let e = self.elevation();
         let (s, c) = self.angle.sin_cos();
-        let h = Vec3A::new(s, 0.0, c);
-        let target = self.centroid + Vec3A::new(0.0, TARGET_Y, 0.0);
+        let h = Vec3A::new(s, -c, 0.0);
+        let target = self.centroid + Vec3A::new(0.0, 0.0, TARGET_Z);
         let breath = if self.mode == CameraMode::Resonance {
             1.0 + RESONANCE_BREATH * (RESONANCE_ORDER * self.angle).cos()
         } else {
             1.0
         };
-        let pos = target + (h * e.cos() + Vec3A::Y * e.sin()) * (self.overview_distance() * breath);
+        let pos = target + (h * e.cos() + Vec3A::Z * e.sin()) * (self.overview_distance() * breath);
         Camera::look_at(pos, target, HFOV_DEG, VFOV_DEG)
     }
 
@@ -336,8 +336,8 @@ impl CameraRig {
     fn overview(&self) -> (Vec3A, Vec3A) {
         let (s, c) = self.angle.sin_cos();
         let bob = if self.mode == CameraMode::Orbit { self.bob * (2.0 * self.angle).sin() } else { 0.0 };
-        let pos = self.centroid + Vec3A::new(self.radius * s, self.height + bob, self.radius * c);
-        (pos, self.centroid + Vec3A::new(0.0, TARGET_Y, 0.0))
+        let pos = self.centroid + Vec3A::new(self.radius * s, -(self.radius * c), self.height + bob);
+        (pos, self.centroid + Vec3A::new(0.0, 0.0, TARGET_Z))
     }
 
     /// Where focus mode wants to be for a solid centred at `p`: on the line
@@ -380,7 +380,7 @@ impl CameraRig {
     /// `base` moved along its line to the look-at point to `k` times its
     /// distance.
     fn scaled(&self, base: &Camera, k: f32) -> Camera {
-        let target = self.centroid + Vec3A::new(0.0, TARGET_Y, 0.0);
+        let target = self.centroid + Vec3A::new(0.0, 0.0, TARGET_Z);
         Camera { pos: target + (base.pos - target) * k, ..*base }
     }
 
@@ -454,23 +454,23 @@ mod tests {
         let before = r.camera().pos;
         r.advance(5.0, Some(Vec3A::X));
         assert_eq!(r.camera().pos, before);
-        assert!(before.z > 0.0 && before.x.abs() < 1e-6, "in front, on +z");
+        assert!(before.y < 0.0 && before.x.abs() < 1e-6, "in front, on -y");
     }
 
     #[test]
     fn orbit_circles_centroid_at_period() {
-        let c = Vec3A::new(1.0, 0.0, -2.0);
+        let c = Vec3A::new(1.0, 2.0, 0.0);
         let mut r = CameraRig::new(&CameraParams { bob: 0.0, ..params(CameraMode::Orbit, OrbitDir::Ccw) }, c, 3.7);
-        let d0 = (r.camera().pos - c) * Vec3A::new(1.0, 0.0, 1.0);
+        let d0 = (r.camera().pos - c) * Vec3A::new(1.0, 1.0, 0.0);
         r.advance(2.5, None); // quarter turn
         let p = r.camera().pos - c;
-        assert!(((p * Vec3A::new(1.0, 0.0, 1.0)).length() - d0.length()).abs() < 1e-4, "constant radius");
-        assert!(p.x > 0.0 && p.z.abs() < 1e-3, "ccw from +z goes to +x: {p:?}");
+        assert!(((p * Vec3A::new(1.0, 1.0, 0.0)).length() - d0.length()).abs() < 1e-4, "constant radius");
+        assert!(p.x > 0.0 && p.y.abs() < 1e-3, "ccw from -y goes to +x: {p:?}");
         r.advance(7.5, None);
         assert!(r.angle() < 1e-4 || (TAU - r.angle()) < 1e-4, "full turn after one period");
         // looks at the centroid
         let cam = r.camera();
-        let to = (c + Vec3A::new(0.0, TARGET_Y, 0.0) - cam.pos).normalize();
+        let to = (c + Vec3A::new(0.0, 0.0, TARGET_Z) - cam.pos).normalize();
         assert!(cam.forward.dot(to) > 0.9999);
     }
 
@@ -492,7 +492,7 @@ mod tests {
         let p = CameraParams { focus_zoom: 1.0, focus_tau: 0.5, ..params(CameraMode::Focus, OrbitDir::Cw) };
         let mut r = CameraRig::new(&p, Vec3A::ZERO, 3.7);
         let start = r.camera().pos;
-        let solid = Vec3A::new(2.7, 1.0, 0.0);
+        let solid = Vec3A::new(2.7, 0.0, 1.0);
         let (want, _) = r.focus_shot(solid);
         assert!(((want - solid).length() - FOCUS_CLOSE).abs() < 1e-3, "zoom 1 = close-up distance");
         r.advance(0.5, Some(solid));
@@ -517,11 +517,11 @@ mod tests {
 
     #[test]
     fn tilt_orbits_between_20_and_80_degrees_and_holds_at_each_end() {
-        let c = Vec3A::new(1.0, 0.5, -2.0);
+        let c = Vec3A::new(1.0, 2.0, 0.5);
         let period = 10.0;
         let p = CameraParams { period, ..params(CameraMode::Tilt, OrbitDir::Ccw) };
         let mut r = CameraRig::new(&p, c, 3.7);
-        let target = c + Vec3A::new(0.0, TARGET_Y, 0.0);
+        let target = c + Vec3A::new(0.0, 0.0, TARGET_Z);
         let ov = CameraRig::new(&CameraParams { bob: 0.0, ..params(CameraMode::Static, OrbitDir::Ccw) }, c, 3.7).camera();
         let dist = (ov.pos - target).length();
         assert!((r.camera().pos - ov.pos).length() < 1e-3, "starts at the overview shot");
@@ -536,9 +536,9 @@ mod tests {
             let e = r.elevation();
             let rel = cam.pos - target;
             assert!((rel.length() - dist).abs() < 1e-3, "on the arc");
-            assert!((rel.normalize().y - e.sin()).abs() < 1e-4, "at its elevation");
+            assert!((rel.normalize().z - e.sin()).abs() < 1e-4, "at its elevation");
             assert!((TILT_LOW - 1e-5..=TILT_HIGH + 1e-5).contains(&e), "between 20 and 80 degrees: {}", e.to_degrees());
-            assert!(cam.forward.dot(-rel.normalize()) > 0.9999 && cam.up.y > 0.0, "looks at the orbit point, upright");
+            assert!(cam.forward.dot(-rel.normalize()) > 0.9999 && cam.up.z > 0.0, "looks at the orbit point, upright");
             assert!(cam.right.dot(prev.right) > 0.99, "smooth");
             (lo, hi) = (lo.min(e), hi.max(e));
             if e == TILT_HIGH {
@@ -563,7 +563,7 @@ mod tests {
         let c = Vec3A::new(0.0, 0.0, 0.0);
         let period = 12.0;
         let mut r = CameraRig::new(&CameraParams { period, ..params(CameraMode::Resonance, OrbitDir::Cw) }, c, 3.7);
-        let target = c + Vec3A::new(0.0, TARGET_Y, 0.0);
+        let target = c + Vec3A::new(0.0, 0.0, TARGET_Z);
         let dt = 0.005f32;
         let mut es = Vec::new();
         let start = r.camera().pos;
@@ -571,7 +571,7 @@ mod tests {
         for _ in 0..(period / dt).round() as usize {
             r.advance(dt, None);
             let cam = r.camera();
-            assert!(cam.right.dot(prev.right) > 0.999 && cam.up.y > 0.0, "smooth and upright");
+            assert!(cam.right.dot(prev.right) > 0.999 && cam.up.z > 0.0, "smooth and upright");
             assert!(cam.forward.dot((target - cam.pos).normalize()) > 0.9999);
             es.push(r.elevation());
             prev = cam;
@@ -589,7 +589,7 @@ mod tests {
         let spheres = |spread: f32| -> Vec<(Vec3A, f32)> {
             (0..6).map(|i| {
                 let a = i as f32 * TAU / 6.0;
-                (Vec3A::new(spread * a.cos(), 1.0, spread * a.sin()), 1.0)
+                (Vec3A::new(spread * a.cos(), -(spread * a.sin()), 1.0), 1.0)
             })
             .collect()
         };
@@ -621,7 +621,7 @@ mod tests {
                 assert!((r.zoom() - r.fit_factor(&tight)).abs() < 0.05, "settles on the fit");
             }
             // looks at the same point throughout
-            let target = c + Vec3A::new(0.0, TARGET_Y, 0.0);
+            let target = c + Vec3A::new(0.0, 0.0, TARGET_Z);
             assert!(r.camera().forward.dot((target - r.camera().pos).normalize()) > 0.9999);
         }
         // off, or the focus camera: distance untouched

@@ -119,8 +119,7 @@ pub const BAND_SPREAD: f32 = 1.25;
 /// How complex a solid is: its edge count (= faces + vertices − 2), faces
 /// breaking ties (the icosahedron ranks above the dodecahedron).
 pub fn complexity(kind: crate::scene::sdf::SolidKind) -> f32 {
-    let (f, v) = kind.counts();
-    (f + v - 2) as f32 * (1.0 + f as f32 / 1000.0)
+    kind.complexity()
 }
 
 /// Each solid's place on the frequency gradient, 0 (bass) ..= 1 (treble):

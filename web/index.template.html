@@ -28,13 +28,20 @@
     position: absolute; top: 0; left: 0; user-select: none; }
   #probe { position: absolute; visibility: hidden; white-space: pre; line-height: 1;
     font-family: Consolas, "Cascadia Mono", Menlo, "DejaVu Sans Mono", monospace; }
-  #toggle { position: fixed; top: 10px; right: 10px; z-index: 3; background: var(--panel-solid); color: var(--fg);
-    border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px; cursor: pointer; font: inherit; }
+  /* The button rides on the panel, just outside its top-left corner, so it
+     slides with it: beside the open panel, at the screen's edge when hidden. */
+  #toggle { position: absolute; top: 10px; right: calc(100% + 8px); z-index: 3; background: var(--panel-solid); color: var(--fg);
+    border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px; cursor: pointer; font: inherit; white-space: nowrap; }
   #toggle:hover { border-color: var(--accent); }
   #panel { position: fixed; top: 0; right: 0; bottom: 0; width: min(380px, 100vw); z-index: 2; background: var(--panel);
     backdrop-filter: blur(6px); border-left: 1px solid var(--line); display: flex; flex-direction: column;
     transform: translateX(0); transition: transform .18s ease; }
   #panel.hidden { transform: translateX(100%); }
+  /* Phones: the open panel fills the width, so the button tucks inside its corner. */
+  @media (max-width: 520px) {
+    #panel:not(.hidden) #toggle { right: auto; left: 10px; }
+    #panel:not(.hidden) header { padding-top: 48px; }
+  }
   #panel header { padding: 12px 14px 8px; border-bottom: 1px solid var(--line); }
   #panel h1 { font-size: 15px; margin: 0 0 2px; font-weight: 600; letter-spacing: .02em; }
   #panel .sub { color: var(--muted); font-size: 12px; }
@@ -88,9 +95,9 @@
 </head>
 <body>
 <div id="stage"><pre id="screen">loading…</pre><span id="probe"></span></div>
-<button id="toggle" title="Show or hide settings (g)">⚙ Settings</button>
 
 <aside id="panel">
+  <button id="toggle" title="Show or hide settings (g)">⚙ Settings</button>
   <header>
     <h1>platomon · web preview</h1>
     <div class="sub">Simulated sensors, real renderer (Rust → WebAssembly, single thread).</div>
@@ -160,7 +167,7 @@ const METRICS = [
   { key: "disk-dev:E:\\", def: "truncated-cube", on: false },
 ];
 const RAMPS = { default: " .,:;-~=+*ox#%&@", classic: " .:-=+*#%@", "32-level": " `-.':\"~=*+c7ix5ah6HmB80$MWNQg&@", blocks: " ░▒▓█", dots: " ·:∙•●" };
-const SOUND_SOURCES = ["off", "simulated music", "microphone", "tab / system audio"];
+const SOUND_SOURCES = ["off", "simulated music", "microphone", "chiptune"];
 const GRADIENTS = ["inferno","viridis","plasma","fire","ice","ocean","sunset","matrix","amber","grey","traffic","rainbow"];
 const ASPECTS = ["fill","vga","svga","xga","sxga","wxga","hd","wxga+","fhd","wuxga","qhd","uwfhd","uwqhd","uhd","square","21:9","32:9"];
 
@@ -175,6 +182,7 @@ const SECTIONS = [
   ]},
   { title: "Sound halo", kind: "sound", open: true, fields: [
     { id: "sound_source", label: "Sound source", type: "select", options: SOUND_SOURCES, init: "simulated music" },
+    { id: "volume", label: "Chiptune volume", type: "range", min: 0, max: 1, step: 0.05, init: 0.5, fmt: v => Math.round(v * 100) + "%" },
     { id: "halo_wide", label: "Size swing", type: "select", options: ["±10%", "±30%", "±60%"], init: "±10%" },
     { id: "halo_bands", label: "Bounce source", type: "select", options: ["by frequency", "overall level"], init: "by frequency" },
   ], hint: "A second wireframe of each solid, 1.2× its size, grows with the sound level; its brightness follows the bass; tags keep clear of its largest size. " +
@@ -199,7 +207,10 @@ const SECTIONS = [
     { id: "tags", label: "Solid tags", type: "check", init: true, def: false, flag: "--tags" },
     { id: "tag_color_mode", label: "Tag colour", type: "select", options: ["complement","theme","white","custom"], init: "complement", kind: "view" },
     { id: "tag_color", label: "Tag hex", type: "text", init: "complement", def: "complement", flag: "--tag-color", placeholder: "#RRGGBB" },
+    { id: "tag_place", label: "Tag position", type: "select", options: ["circle","beside","corner","below","trailing"], init: "circle", def: "circle", flag: "--tag-place" },
     { id: "tag_blocks", label: "Block letters", type: "check", init: true, def: false, flag: "--tag-blocks" },
+    { id: "tag_size", label: "Block size", type: "select", options: ["1×","2×","3×"], init: "1×", kind: "view" },
+    { id: "tag_font", label: "Block font", type: "select", options: ["strokes","hash","dots","stars","at","bricks"], init: "strokes", kind: "view" },
     { id: "tag_fixed_len", label: "Fixed tag length", type: "check", init: false, def: false, flag: "--tag-fixed-length" },
     { id: "wireframe", label: "Wireframe", type: "check", init: false, def: false, flag: "--wireframe" },
   ]},
@@ -208,6 +219,7 @@ const SECTIONS = [
     { id: "color", label: "Hex stops", type: "text", init: "off", def: "off", flag: "--color", placeholder: "#000:#f80:#fff" },
     { id: "color_by", label: "Colour by", type: "select", options: ["lum","load","spin","sound"], init: "lum", def: "lum", flag: "--color-by" },
     { id: "colors", label: "Palette", type: "select", options: ["16","32","64","128"], init: "16", def: "16", flag: "--colors", fmt: v => v + " colours" },
+    { id: "halo_color", label: "Halo colour", type: "select", options: ["under","solid","size","bass"], init: "under", def: "under" },
     { id: "bg_color", label: "Background colour", type: "select", options: ["auto","off","match", ...GRADIENTS], init: "auto", def: "auto", flag: "--bg-color" },
     { id: "color_reverse", label: "Reverse", type: "check", init: false, def: false, flag: "--color-reverse" },
   ]},
@@ -226,9 +238,24 @@ const SECTIONS = [
   ]},
   { title: "Background", kind: "live", fields: [
     { id: "bg_lum", label: "Luminosity", type: "range", min: 0, max: 10, step: 0.5, init: 0, def: 5, flag: "--bg-lum", fmt: v => v == 0 ? "off" : v },
-    { id: "bg_pattern", label: "Pattern", type: "select", options: ["solid","checker","diamond","brick","triangles","hex","radial","quasicrystal"], init: "solid", def: "solid", flag: "--bg-pattern" },
-    { id: "bg_waves", label: "Waves", type: "range", min: 3, max: 24, step: 1, init: 7, def: 7, flag: "--bg-waves", fmt: v => v + "-fold" },
-    { id: "bg_wave_speed", label: "Wave speed", type: "range", min: -3, max: 3, step: 0.1, init: 0.6, def: 0.6, flag: "--bg-wave-speed", fmt: v => v + " rad/s" },
+    { id: "bg_pattern", label: "Pattern", type: "select", options: ["solid","checker","diamond","brick","triangles","hex","radial","quasicrystal","rain","ocean","julia","carpet","clouds","polka"], init: "solid", def: "solid", flag: "--bg-pattern" },
+    { id: "bg_waves", label: "Waves", type: "range", min: 3, max: 24, step: 1, init: 7, def: 7, flag: "--bg-waves", fmt: v => v + "-fold", pattern: ["quasicrystal"] },
+    { id: "bg_wave_speed", label: "Flow speed", type: "range", min: -3, max: 3, step: 0.1, init: 0.6, def: 0.6, flag: "--bg-wave-speed", fmt: v => v + " rad/s", pattern: ["quasicrystal","rain","ocean","julia","clouds"] },
+    { id: "bg_drops", label: "Raindrops", type: "range", min: 1, max: 48, step: 1, init: 12, def: 12, flag: "--bg-drops", pattern: ["rain"] },
+    { id: "bg_ripple", label: "Ripple spacing", type: "range", min: 0.2, max: 4, step: 0.05, init: 0.9, def: 0.9, flag: "--bg-ripple", fmt: v => v + " tiles", pattern: ["rain"] },
+    { id: "bg_drop_life", label: "Ring life", type: "range", min: 0.5, max: 30, step: 0.5, init: 4.5, def: 4.5, flag: "--bg-drop-life", fmt: v => v + " s", pattern: ["rain"] },
+    { id: "bg_wind", label: "Wind direction", type: "range", min: 0, max: 359, step: 1, init: 30, def: 30, flag: "--bg-wind", fmt: v => v + "°", pattern: ["ocean"] },
+    { id: "bg_chop", label: "Chop", type: "range", min: 0, max: 2, step: 0.05, init: 0.6, def: 0.6, flag: "--bg-chop", pattern: ["ocean"] },
+    { id: "bg_julia_iter", label: "Iterations", type: "range", min: 4, max: 128, step: 1, init: 28, def: 28, flag: "--bg-julia-iter", pattern: ["julia"] },
+    { id: "bg_julia_shape", label: "Julia shape", type: "range", min: 0.3, max: 1.2, step: 0.0005, init: 0.7885, def: 0.7885, flag: "--bg-julia-shape", pattern: ["julia"] },
+    { id: "bg_carpet_levels", label: "Carpet levels", type: "range", min: 1, max: 8, step: 1, init: 5, def: 5, flag: "--bg-carpet-levels", pattern: ["carpet"] },
+    { id: "bg_octaves", label: "Octaves", type: "range", min: 1, max: 10, step: 1, init: 5, def: 5, flag: "--bg-octaves", pattern: ["clouds"] },
+    { id: "bg_roughness", label: "Roughness", type: "range", min: 0.1, max: 0.9, step: 0.05, init: 0.5, def: 0.5, flag: "--bg-roughness", pattern: ["clouds"] },
+    { id: "bg_sectors", label: "Sectors", type: "range", min: 2, max: 64, step: 1, init: 12, def: 12, flag: "--bg-sectors", pattern: ["radial"] },
+    { id: "bg_dot_size", label: "Dot size", type: "range", min: 0.05, max: 4, step: 0.05, init: 0.5, def: 0.5, flag: "--bg-dot-size", fmt: v => v + " tiles", pattern: ["polka"] },
+    { id: "bg_dot_spacing", label: "Dot spacing", type: "range", min: 0.25, max: 8, step: 0.05, init: 1, def: 1, flag: "--bg-dot-spacing", fmt: v => v + " tiles", pattern: ["polka"] },
+    { id: "bg_dot_variability", label: "Dot variability", type: "range", min: 0, max: 1, step: 0.05, init: 0, def: 0, flag: "--bg-dot-variability", pattern: ["polka"] },
+    { id: "bg_invert_half", label: "Invert half", type: "check", init: false, def: false, flag: "--bg-invert-half", pattern: ["polka"] },
     { id: "bg_contrast", label: "Contrast", type: "range", min: 0, max: 1, step: 0.05, init: 0.5, def: 0.5, flag: "--bg-contrast" },
     { id: "bg_scale", label: "Tile size", type: "range", min: 0.2, max: 5, step: 0.1, init: 1, def: 1, flag: "--bg-scale" },
     { id: "bg_scroll_x", label: "Scroll X /s", type: "range", min: -2, max: 2, step: 0.1, init: 0, def: 0 },
@@ -247,7 +274,17 @@ const SECTIONS = [
   ]},
   { title: "Scene & camera", kind: "restart", fields: [
     { id: "metrics", type: "metrics" },
-    { id: "layout", label: "Layout", type: "select", options: ["rings","sphere"], init: "rings", def: "rings", flag: "--layout" },
+    { id: "layout", label: "Layout", type: "select", options: ["rings","sphere","line","stack","orbit"], init: "rings", def: "rings", flag: "--layout" },
+    { id: "ordering", label: "Ordering", type: "select", options: ["listed","simple","complex","random"], init: "listed", def: "listed", flag: "--ordering" },
+    { id: "spacing", label: "Spacing", type: "range", min: 0.25, max: 4, step: 0.05, init: 1, def: 1, flag: "--spacing", fmt: v => v + "×" },
+    { id: "distance_scale", label: "Distance scaling", type: "range", min: -2, max: 2, step: 0.1, init: 0, def: 0, flag: "--distance-scale", fmt: v => v == 0 ? "off" : v },
+    { id: "orbit_center", label: "Centre solid", type: "select", options: ["cpu","ram","net","disk","size","spin"], init: "cpu", def: "cpu", flag: "--orbit-center", layout: ["orbit"] },
+    { id: "orbit_velocity", label: "Orbit speed", type: "range", min: 0.05, max: 2, step: 0.05, init: 0.35, def: 0.35, flag: "--orbit-velocity", fmt: v => v + " rad/s", layout: ["orbit"] },
+    { id: "orbit_inclination", label: "Inclination", type: "range", min: 0, max: 90, step: 1, init: 15, def: 15, flag: "--orbit-inclination", fmt: v => v + "°", layout: ["orbit"] },
+    { id: "orbit_eccentricity", label: "Eccentricity", type: "range", min: 0, max: 0.8, step: 0.05, init: 0.15, def: 0.15, flag: "--orbit-eccentricity", layout: ["orbit"] },
+    { id: "orbit_variation", label: "Variation", type: "range", min: 0, max: 1, step: 0.05, init: 0.3, def: 0.3, flag: "--orbit-variation", layout: ["orbit"] },
+    { id: "bindings", label: "Per-solid inputs", type: "text", init: "", def: "", flag: "--bind", placeholder: "auto|cpu|delta:ram|cpu|off ; ..." },
+    { id: "delta_period", label: "Delta period", type: "range", min: 1, max: 600, step: 1, init: 10, def: 10, flag: "--delta-period", fmt: v => v + " s" },
     { id: "camera", label: "Camera", type: "select", options: ["static","orbit","focus","tilt","resonance"], init: "orbit", def: "static", flag: "--camera" },
     { id: "auto_distance", label: "Auto distance", type: "check", init: false, def: false, flag: "--auto-distance" },
     { id: "focus_zoom", label: "Focus zoom", type: "range", min: 0, max: 1, step: 0.05, init: 0.6, def: 0.6, flag: "--focus-zoom" },
@@ -283,10 +320,14 @@ const q = s => JSON.stringify(String(s));            // TOML basic string
 const num = v => { const n = Number(v); return Number.isFinite(n) ? (Number.isInteger(n) ? n.toFixed(1) : String(n)) : "0.0"; };
 const int = v => String(Math.round(Number(v) || 0));
 
+const bindList = s => String(s || "").split(";").map(x => x.trim()).filter(Boolean);
+
 function tomlFor(v, rows, seed) {
   const L = [];
   const shown = rows.filter(r => r.on);
   L.push("show = [" + shown.map(r => q(r.key)).join(", ") + "]");
+  const binds = bindList(v.bindings);
+  if (binds.length) L.push("bindings = [" + binds.map(q).join(", ") + "]", "delta_period = " + num(v.delta_period));
   L.push("fps_min = " + num(v.fps_min), "fps_max = " + num(v.fps_max), "fps_curve = " + q(v.fps_curve),
          "fps_slew = " + num(v.fps_slew), "fps_invert = " + !!v.fps_invert);
   L.push("spp = " + int(v.spp), "bounces = " + int(v.bounces), "max_steps = " + int(v.max_steps),
@@ -295,9 +336,12 @@ function tomlFor(v, rows, seed) {
          "show_stats = " + !!v.show_stats, "aspect = " + q(v.aspect), "aspect_mode = " + q(v.aspect_mode));
   L.push("legend = " + !!v.legend, "legend_size = " + int(v.legend_size), "legend_opacity = " + num(v.legend_opacity),
          "legend_pos = " + q(v.legend_pos), "wireframe = " + !!v.wireframe,
-         "tags = " + !!v.tags, "tag_color = " + q(v.tag_color || "complement"), "tag_blocks = " + !!v.tag_blocks, "tag_fixed_len = " + !!v.tag_fixed_len);
+         "tags = " + !!v.tags, "tag_color = " + q(v.tag_color || "complement"), "tag_blocks = " + !!v.tag_blocks, "tag_fixed_len = " + !!v.tag_fixed_len, "tag_place = " + q(v.tag_place));
   L.push("color = " + q(v.color || "off"), "color_by = " + q(v.color_by), "colors = " + int(v.colors), "bg_color = " + q(v.bg_color),
-         "color_reverse = " + !!v.color_reverse, "layout = " + q(v.layout));
+         "color_reverse = " + !!v.color_reverse, "halo_color = " + q(v.halo_color),
+         "layout = " + q(v.layout), "ordering = " + q(v.ordering), "spacing = " + num(v.spacing), "distance_scale = " + num(v.distance_scale),
+         "orbit_center = " + q(v.orbit_center), "orbit_velocity = " + num(v.orbit_velocity), "orbit_inclination = " + num(v.orbit_inclination),
+         "orbit_eccentricity = " + num(v.orbit_eccentricity), "orbit_variation = " + num(v.orbit_variation));
   L.push("camera = " + q(v.camera), "orbit_period = " + num(v.orbit_period), "orbit_dir = " + q(v.orbit_dir),
          "orbit_bob = " + num(v.orbit_bob), "focus_zoom = " + num(v.focus_zoom), "focus_tau = " + num(v.focus_tau),
          "auto_distance = " + !!v.auto_distance);
@@ -308,7 +352,13 @@ function tomlFor(v, rows, seed) {
          "bg_scale = " + num(v.bg_scale), "bg_scroll = [" + num(v.bg_scroll_x) + ", " + num(v.bg_scroll_z) + "]",
          "bg_sway = " + num(v.bg_sway), "bg_sway_period = " + num(v.bg_sway_period), "bg_rotate = " + q(v.bg_rotate),
          "bg_rotate_period = " + num(v.bg_rotate_period), "bg_waves = " + int(v.bg_waves), "bg_wave_speed = " + num(v.bg_wave_speed),
-         "far_ground = " + !!v.far_ground);
+         "far_ground = " + !!v.far_ground,
+         "bg_drops = " + int(v.bg_drops), "bg_ripple = " + num(v.bg_ripple), "bg_drop_life = " + num(v.bg_drop_life),
+         "bg_wind = " + num(v.bg_wind), "bg_chop = " + num(v.bg_chop), "bg_julia_iter = " + int(v.bg_julia_iter),
+         "bg_julia_shape = " + num(v.bg_julia_shape), "bg_carpet_levels = " + int(v.bg_carpet_levels), "bg_octaves = " + int(v.bg_octaves),
+         "bg_roughness = " + num(v.bg_roughness), "bg_sectors = " + int(v.bg_sectors), "bg_dot_size = " + num(v.bg_dot_size),
+         "bg_dot_spacing = " + num(v.bg_dot_spacing), "bg_dot_variability = " + num(v.bg_dot_variability),
+         "bg_invert_half = " + !!v.bg_invert_half);
   L.push("min_scale = " + num(v.min_scale), "max_scale = " + num(v.max_scale), "idle_spin = " + num(v.idle_spin),
          "max_spin = " + num(v.max_spin), "smoothing_tau = " + num(v.smoothing_tau), "poll_hz = " + num(v.poll_hz));
   const solids = shown.filter(r => r.solid !== r.def), rings = shown.filter(r => r.ring !== "auto");
@@ -336,6 +386,7 @@ function cliFor(v, rows) {
     if (!f.flag) { if (!(id === "char_aspect" && v.char_auto)) configOnly++; continue; }
     if (f.type === "check") { if (val) a.push(f.flag); else configOnly++; continue; }
     if (id === "color_by" && val === "sound") { soundOnly = true; continue; }
+    if (id === "bindings") { for (const b of bindList(val)) a.push(f.flag, psQuote(b)); continue; }
     if (id === "legend_pos") { a.push(f.flag, { "top-left": "tl", "top-right": "tr", "bottom-left": "bl", "bottom-right": "br" }[val]); continue; }
     a.push(f.flag, psQuote(String(val)));
   }
@@ -391,33 +442,47 @@ const capturing = () => !!audio;
 
 function stopCapture() {
   if (!audio) return;
-  for (const t of audio.stream.getTracks()) t.stop();
+  if (audio.stream) for (const t of audio.stream.getTracks()) t.stop();
+  if (audio.player) { try { audio.player.stop(); } catch (_) {} }
   audio.ctx.close().catch(() => {});
   audio = null;
 }
 
-async function startCapture(kind) {
-  stopCapture();
-  let stream;
-  if (kind === "microphone") {
-    stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
-  } else {
-    stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true, systemAudio: "include" });
-    for (const t of stream.getVideoTracks()) t.stop();
-    if (!stream.getAudioTracks().length) {
-      for (const t of stream.getTracks()) t.stop();
-      throw new Error("no audio was shared: pick a tab (or the screen on Windows) and tick 'Share audio'");
-    }
-  }
+async function newContext() {
   const ctx = new AudioContext();
   await ctx.resume().catch(() => {});             // may start suspended outside a click
   const analyser = ctx.createAnalyser();
   analyser.fftSize = 2048;
+  return { ctx, analyser };
+}
+
+async function startMicrophone() {
+  stopCapture();
+  if (!navigator.mediaDevices) throw new Error("the microphone needs a secure (https) page");
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
+  const { ctx, analyser } = await newContext();
   ctx.createMediaStreamSource(stream).connect(analyser);
-  audio = { ctx, analyser, stream, buf: new Float32Array(2048), kind };
+  audio = { ctx, analyser, stream, buf: new Float32Array(2048), kind: "microphone" };
   for (const t of stream.getAudioTracks()) t.addEventListener("ended", () => {
     if (audio && audio.stream === stream) { stopCapture(); values.sound_source = "simulated music"; sendSound(false); syncControls(); }
   });
+}
+
+// The chiptune is rendered by the wasm side, played on a loop and analysed
+// on its way to the speakers, so the halo follows exactly what is heard.
+async function startChiptune() {
+  stopCapture();
+  const { ctx, analyser } = await newContext();
+  const n = W.chiptune_render(ctx.sampleRate);
+  const buffer = ctx.createBuffer(1, n, ctx.sampleRate);
+  buffer.copyToChannel(new Float32Array(W.memory.buffer, W.chiptune_ptr(), n), 0);
+  W.chiptune_free();
+  const player = ctx.createBufferSource();
+  player.buffer = buffer; player.loop = true;
+  const gain = ctx.createGain(); gain.gain.value = Number(values.volume);
+  player.connect(analyser); player.connect(gain); gain.connect(ctx.destination);
+  player.start();
+  audio = { ctx, analyser, player, gain, buf: new Float32Array(2048), kind: "chiptune" };
 }
 
 function pushAudio() {
@@ -428,15 +493,20 @@ function pushAudio() {
   W.audio_push(audio.buf.length, audio.ctx.sampleRate);
 }
 
+// Block-letter tag size and font: web-only (the desktop program draws 1× strokes).
+function sendTagStyle() {
+  W.set_tag_style(["1×", "2×", "3×"].indexOf(values.tag_size) + 1, ["strokes", "hash", "dots", "stars", "at", "bricks"].indexOf(values.tag_font));
+}
+
 async function sendSound(sourceChanged) {
   const src = values.sound_source;
+  if (audio && audio.gain) audio.gain.gain.value = Number(values.volume);
   const wide = Math.max(0, ["±10%", "±30%", "±60%"].indexOf(values.halo_wide)), bands = values.halo_bands === "by frequency" ? 1 : 0;
   if (sourceChanged) {
-    if (src === "microphone" || src === "tab / system audio") {
+    if (src === "microphone" || src === "chiptune") {
       try {
-        if (!navigator.mediaDevices) throw new Error("audio capture needs a secure (https) page");
-        await startCapture(src);
-        $("msg").className = "ok"; $("msg").textContent = "Listening to " + src + ".";
+        if (src === "microphone") await startMicrophone(); else await startChiptune();
+        $("msg").className = "ok"; $("msg").textContent = src === "chiptune" ? "Playing the chiptune (loops every 25.6 s)." : "Listening to the microphone.";
       } catch (e) {
         $("msg").className = ""; $("msg").textContent = "Sound: " + (e && e.message || e) + " — using simulated music.";
         values.sound_source = "simulated music"; syncControls();
@@ -497,7 +567,9 @@ function metricsControl() {
   });
   t.append(tb); wrap.append(t);
   const h = document.createElement("div"); h.className = "hint";
-  h.textContent = "Max 16 metrics. Simulated adapters: Ethernet, Wi-Fi, vEthernet; disks C:\\ D:\\ E:\\.";
+  h.textContent = "Max 16 metrics. Simulated adapters: Ethernet, Wi-Fi, vEthernet; disks C:\\ D:\\ E:\\. " +
+    "Per-solid inputs (below) replace this table: one SHAPE|SIZE|SPIN|COLOUR|COMPLEXITY per solid, separated by ';' (max 12); " +
+    "an input is a metric, delta:METRIC (its change over the delta period) or off.";
   wrap.append(h);
   return wrap;
 }
@@ -532,14 +604,22 @@ function syncControls() {
   $("f-color").disabled = values.color_preset !== "custom";
   $("f-tag_color").disabled = values.tag_color_mode !== "custom" || !values.tags;
   for (const id of ["tag_color_mode", "tag_blocks"]) $("f-" + id).disabled = !values.tags;
-  for (const id of ["bg_waves", "bg_wave_speed"]) $("f-" + id).disabled = values.bg_pattern !== "quasicrystal";
+  // Per-pattern and per-layout options: only the chosen one's rows show.
+  for (const id in FIELDS) {
+    const f = FIELDS[id], row = $("f-" + id)?.closest(".row"); if (!row) continue;
+    const show = (!f.pattern || f.pattern.includes(values.bg_pattern)) && (!f.layout || f.layout.includes(values.layout));
+    row.style.display = show ? "" : "none";
+  }
   for (const id of ["color_by", "color_reverse"]) $("f-" + id).disabled = values.color === "off";
-  $("f-tag_fixed_len").disabled = !values.tags;
+  $("f-tag_fixed_len").disabled = !values.tags || !["beside","below","trailing"].includes(values.tag_place);
+  for (const id of ["tag_place"]) $("f-" + id).disabled = !values.tags;
+  for (const id of ["tag_size", "tag_font"]) $("f-" + id).disabled = !values.tags || !values.tag_blocks;
   $("f-auto_distance").disabled = values.camera === "focus";
   for (const id of ["focus_zoom", "focus_tau"]) $("f-" + id).disabled = values.camera !== "focus";
   for (const id of ["orbit_period", "orbit_dir", "orbit_bob", "orbit_radius", "orbit_height"]) $("f-" + id).disabled = !["orbit", "tilt", "resonance"].includes(values.camera);
   $("f-manual").disabled = values.profile !== "manual";
   for (const id of ["halo_wide", "halo_bands"]) $("f-" + id).disabled = values.sound_source === "off";
+  $("f-volume").disabled = values.sound_source !== "chiptune";
   document.querySelectorAll("table.metrics tbody tr").forEach(tr => {
     const r = metricRows[tr.dataset.i]; const [on, so, ri] = tr.querySelectorAll("input,select");
     on.checked = r.on; so.value = r.solid; ri.value = r.ring;
@@ -582,6 +662,7 @@ function onChange(f) {
   if (f.id === "max_scale" && values.min_scale > values.max_scale) values.min_scale = values.max_scale;
   if (f.kind === "sim") sendSim();
   if (f.kind === "sound") sendSound(f.id === "sound_source");
+  if (f.id === "tag_size" || f.id === "tag_font") sendTagStyle();
   if (f.id === "font" || f.id === "char_auto") measure();
   if (liveMode && (f.kind === "live" || f.id === "ramp_preset" || f.id === "color_preset" || f.id === "tag_color_mode" || f.id === "char_auto" || f.id === "font")) applyLive();
   syncControls();
@@ -734,7 +815,7 @@ $("toggle").onclick = () => $("panel").classList.toggle("hidden");
 $("mode-live").onclick = () => setMode(true);
 $("mode-manual").onclick = () => setMode(false);
 $("apply").onclick = applyRestart;
-$("reset").onclick = () => { initValues(); measure(); buildUI(); sendSim(); sendSound(true); applyRestart(); };
+$("reset").onclick = () => { initValues(); measure(); buildUI(); sendSim(); sendSound(true); sendTagStyle(); applyRestart(); };
 $("copy-cli").onclick = () => navigator.clipboard?.writeText($("cli").value);
 $("copy-toml").onclick = () => navigator.clipboard?.writeText($("toml").value);
 let resizeTimer = 0;
@@ -751,6 +832,7 @@ window.addEventListener("resize", () => {
     await loadWasm();
     sendSim();
     sendSound(false);
+    sendTagStyle();
     applyRestart();
     $("msg").textContent = "";
     requestAnimationFrame(loop);

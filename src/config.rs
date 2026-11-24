@@ -6,12 +6,13 @@ use std::path::{Path, PathBuf};
 
 use crate::aspect::AspectMode;
 use crate::clock::FpsCurve;
-use crate::color::{self, ColorBy, ColorMap, Gradient};
-use crate::scene::Layout;
+use crate::color::{self, ColorBy, ColorMap, Gradient, HaloColor};
+use crate::scene::{Arrangement, DISTANCE_SCALE_RANGE, Layout, OrbitCenter, OrbitParams, Ordering, SPACING_RANGE};
+use crate::drive::{Binding, DELTA_PERIOD_RANGE, Input, MAX_SOLIDS};
 use crate::metrics::{MetricKind, MetricSpec};
-use crate::overlay::{LEGEND_SIZE_MAX, LEGEND_SIZE_MIN, LegendParams, LegendPos};
+use crate::overlay::{LEGEND_SIZE_MAX, LEGEND_SIZE_MIN, LegendParams, LegendPos, TagPlace};
 use crate::scene::camera::{CameraMode, OrbitDir};
-use crate::scene::ground::{self, GroundParams, Pattern, Spin};
+use crate::scene::ground::{self, GroundParams, Pattern, PatternShape, Spin};
 use crate::scene::sdf::SolidKind;
 
 /// Most solids shown at once.
@@ -57,6 +58,11 @@ pub struct Config {
     // --- what to show ---
     /// Metrics, one solid each: `cpu`, `ram`, `disk`, `net`, `gpu`, `nic[:NAME]`, `disk-dev[:NAME]`.
     pub show: Vec<String>,
+    /// Per-solid inputs, one solid each, instead of `show`:
+    /// `SHAPE|SIZE|SPIN|COLOUR|COMPLEXITY` (see [`crate::drive::Binding`]).
+    pub bindings: Vec<String>,
+    /// Delta inputs measure the change over this many seconds.
+    pub delta_period: f32,
 
     // --- frame rate ---
     pub fps_min: f32,
@@ -125,8 +131,29 @@ pub struct Config {
     pub color_reverse: bool,
 
     // --- layout ---
-    /// `rings` (on the ground) or `sphere` (concentric spherical shells).
+    /// `rings` (on the ground), `sphere` (concentric spherical shells),
+    /// `line` (one evenly spaced row) or `stack` (one above another).
     pub layout: Layout,
+    /// Which solid goes where: `listed` (metric order), `simple` (simplest
+    /// first), `complex` (most complex first) or `random`.
+    pub ordering: Ordering,
+    /// Neighbour spacing as a multiple of the standard, 0.25..=4 (orbits:
+    /// each 10% × this of its radius beyond the last).
+    pub spacing: f32,
+    /// Distance scaling, -2..=2: each solid's size times 1 + k × (its
+    /// nearest neighbour's distance / the standard spacing − 1); 0 = off.
+    pub distance_scale: f32,
+    /// Orbit layout: the solid in the centre, `cpu`, `ram`, `net`, `disk`,
+    /// `size` (the largest at the moment) or `spin` (the fastest).
+    pub orbit_center: OrbitCenter,
+    /// Orbit layout: angular speed of the innermost orbit, radians/s.
+    pub orbit_velocity: f32,
+    /// Orbit layout: tilt of the orbits, degrees (0..=90).
+    pub orbit_inclination: f32,
+    /// Orbit layout: 0 = circles, up to 0.8 = long ellipses.
+    pub orbit_eccentricity: f32,
+    /// Orbit layout: spread of the other orbit settings between orbits, 0..=1.
+    pub orbit_variation: f32,
 
     // --- camera ---
     pub camera: CameraMode,
@@ -153,6 +180,13 @@ pub struct Config {
     /// Fixed tag length: tags placed for each solid's current size so the
     /// leader keeps one length, growing only to keep tags off other solids.
     pub tag_fixed_len: bool,
+    /// Where tags go: `circle` (round the picture's centre), `beside`,
+    /// `corner` (stacked in the corners), `below` or `trailing`.
+    pub tag_place: TagPlace,
+    /// Sound halo colour (with a gradient on): `under` (what it passes
+    /// over), `solid` (its own solid's colour), `size` (quiet → loud along
+    /// the gradient) or `bass`. The halo itself is the screensaver's.
+    pub halo_color: HaloColor,
     /// RNG seed for random choices (orbit direction); unset = random.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seed: Option<u64>,
@@ -165,7 +199,7 @@ pub struct Config {
     pub bg_contrast: f32,
     /// Tile size, world units.
     pub bg_scale: f32,
-    /// Constant pattern translation [x, z], world units/s.
+    /// Constant pattern translation across the floor [x, y], world units/s.
     pub bg_scroll: [f32; 2],
     /// Radius of a circular back-and-forth translation; 0 = none.
     pub bg_sway: f32,
@@ -176,8 +210,33 @@ pub struct Config {
     pub bg_rotate_period: f32,
     /// Quasicrystal pattern: number of plane waves (3..=24; its symmetry).
     pub bg_waves: u32,
-    /// Quasicrystal pattern: wave phase speed, radians/s (0 = still).
+    /// Animated patterns' flow: the quasicrystal's wave phase speed,
+    /// radians/s (0 = still); the others move in proportion.
     pub bg_wave_speed: f32,
+    /// Rain pattern: raindrops rippling at once.
+    pub bg_drops: u32,
+    /// Rain: distance between ripples (tiles) and a drop's life (s).
+    pub bg_ripple: f32,
+    pub bg_drop_life: f32,
+    /// Ocean: wind direction (degrees) and crest sharpness.
+    pub bg_wind: f32,
+    pub bg_chop: f32,
+    /// Julia set: iterations, and the radius its constant drifts round.
+    pub bg_julia_iter: u32,
+    pub bg_julia_shape: f32,
+    /// Sierpinski carpet: scales holes are cut at.
+    pub bg_carpet_levels: u32,
+    /// Clouds: octaves, and each finer octave's strength.
+    pub bg_octaves: u32,
+    pub bg_roughness: f32,
+    /// Radial: sectors round the focal point.
+    pub bg_sectors: u32,
+    /// Polka dots: size across and spacing (tiles), how much both vary
+    /// (0..=1), and one half of the floor inverted.
+    pub bg_dot_size: f32,
+    pub bg_dot_spacing: f32,
+    pub bg_dot_variability: f32,
+    pub bg_invert_half: bool,
 
     // --- animation ---
     pub min_scale: f32,
@@ -208,6 +267,8 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             show: ["cpu", "ram", "disk", "net", "gpu"].map(String::from).to_vec(),
+            bindings: Vec::new(),
+            delta_period: crate::drive::DELTA_PERIOD_DEFAULT,
             fps_min: 5.0,
             fps_max: 150.0,
             fps_curve: FpsCurve::Sqrt,
@@ -239,11 +300,21 @@ impl Default for Config {
             color_depth: None,
             color_reverse: false,
             layout: Layout::Rings,
+            ordering: Ordering::Listed,
+            spacing: 1.0,
+            distance_scale: 0.0,
+            orbit_center: OrbitParams::default().center,
+            orbit_velocity: OrbitParams::default().velocity,
+            orbit_inclination: OrbitParams::default().inclination,
+            orbit_eccentricity: OrbitParams::default().eccentricity,
+            orbit_variation: OrbitParams::default().variation,
             focus_zoom: 0.6,
             focus_tau: 1.5,
             auto_distance: false,
             far_ground: false,
             tag_fixed_len: false,
+            tag_place: TagPlace::Circle,
+            halo_color: HaloColor::Under,
             camera: CameraMode::Static,
             orbit_period: 60.0,
             orbit_dir: OrbitDir::Random,
@@ -262,6 +333,21 @@ impl Default for Config {
             bg_rotate_period: 60.0,
             bg_waves: crate::scene::ground::WAVES_DEFAULT,
             bg_wave_speed: crate::scene::ground::WAVE_SPEED_DEFAULT,
+            bg_drops: crate::scene::ground::DROPS_DEFAULT,
+            bg_ripple: PatternShape::default().ripple,
+            bg_drop_life: PatternShape::default().drop_life,
+            bg_wind: PatternShape::default().wind,
+            bg_chop: PatternShape::default().chop,
+            bg_julia_iter: PatternShape::default().julia_iter,
+            bg_julia_shape: PatternShape::default().julia_shape,
+            bg_carpet_levels: PatternShape::default().carpet_levels,
+            bg_octaves: PatternShape::default().octaves,
+            bg_roughness: PatternShape::default().roughness,
+            bg_sectors: PatternShape::default().sectors,
+            bg_dot_size: PatternShape::default().dot_size,
+            bg_dot_spacing: PatternShape::default().dot_spacing,
+            bg_dot_variability: PatternShape::default().dot_variability,
+            bg_invert_half: false,
             min_scale: 0.45,
             max_scale: 1.0,
             max_spin: 3.0,
@@ -280,10 +366,20 @@ impl Default for Config {
 /// One displayed solid.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SlotSpec {
+    /// The metric it is known by (its tag, the orbit centre, its weight).
     pub metric: MetricSpec,
     pub solid: SolidKind,
     /// Requested ring; `None` = automatic.
     pub ring: Option<u32>,
+    /// What drives its size, spin, colour and complexity.
+    pub inputs: [Input; 4],
+}
+
+impl SlotSpec {
+    /// The (shape, inputs) pairs a [`crate::drive::Drives`] takes.
+    pub fn drives(slots: &[SlotSpec]) -> Vec<(SolidKind, [Input; 4])> {
+        slots.iter().map(|s| (s.solid, s.inputs.clone())).collect()
+    }
 }
 
 fn finite_or(v: f32, d: f32) -> f32 {
@@ -347,6 +443,12 @@ impl Config {
         self.bounces = self.bounces.min(8);
         self.max_steps = self.max_steps.clamp(8, 1024);
         self.max_dist = finite_or(self.max_dist, d.max_dist).clamp(5.0, 1000.0);
+        self.spacing = finite_or(self.spacing, d.spacing).clamp(SPACING_RANGE.0, SPACING_RANGE.1);
+        self.distance_scale = finite_or(self.distance_scale, 0.0).clamp(DISTANCE_SCALE_RANGE.0, DISTANCE_SCALE_RANGE.1);
+        self.delta_period = finite_or(self.delta_period, d.delta_period).clamp(DELTA_PERIOD_RANGE.0, DELTA_PERIOD_RANGE.1);
+        let o = self.orbit_params().sanitized();
+        (self.orbit_velocity, self.orbit_inclination, self.orbit_eccentricity, self.orbit_variation) =
+            (o.velocity, o.inclination, o.eccentricity, o.variation);
 
         if self.ramp.chars().count() < 2 {
             self.ramp = d.ramp.clone();
@@ -377,6 +479,12 @@ impl Config {
         self.bg_rotate_period = finite_or(self.bg_rotate_period, d.bg_rotate_period).clamp(0.5, 86_400.0);
         self.bg_waves = self.bg_waves.clamp(crate::scene::ground::WAVES_MIN, crate::scene::ground::WAVES_MAX);
         self.bg_wave_speed = finite_or(self.bg_wave_speed, d.bg_wave_speed).clamp(-20.0, 20.0);
+        self.bg_drops = self.bg_drops.clamp(crate::scene::ground::DROPS_MIN, crate::scene::ground::DROPS_MAX);
+        let s = self.pattern_shape().sanitized();
+        (self.bg_ripple, self.bg_drop_life, self.bg_wind, self.bg_chop) = (s.ripple, s.drop_life, s.wind, s.chop);
+        (self.bg_julia_iter, self.bg_julia_shape, self.bg_carpet_levels) = (s.julia_iter, s.julia_shape, s.carpet_levels);
+        (self.bg_octaves, self.bg_roughness, self.bg_sectors) = (s.octaves, s.roughness, s.sectors);
+        (self.bg_dot_size, self.bg_dot_spacing, self.bg_dot_variability) = (s.dot_size, s.dot_spacing, s.dot_variability);
         for v in [&mut self.orbit_radius, &mut self.orbit_height] {
             *v = v.filter(|x| x.is_finite()).map(|x| x.clamp(0.5, 500.0));
         }
@@ -402,6 +510,60 @@ impl Config {
         }
     }
 
+    /// The orbit layout's settings.
+    pub fn orbit_params(&self) -> OrbitParams {
+        OrbitParams {
+            center: self.orbit_center,
+            velocity: self.orbit_velocity,
+            inclination: self.orbit_inclination,
+            eccentricity: self.orbit_eccentricity,
+            variation: self.orbit_variation,
+        }
+    }
+
+    /// How `slots` are placed (the random ordering and the orbits'
+    /// variation follow the seed).
+    pub fn arrangement(&self, slots: &[SlotSpec]) -> Arrangement {
+        // A metric centre: that metric's solid, or its per-device kind's.
+        let kinds: &[MetricKind] = match self.orbit_center {
+            OrbitCenter::Cpu => &[MetricKind::Cpu],
+            OrbitCenter::Ram => &[MetricKind::Ram],
+            OrbitCenter::Net => &[MetricKind::Net, MetricKind::Nic],
+            OrbitCenter::Disk => &[MetricKind::Disk, MetricKind::DiskDev],
+            OrbitCenter::Size | OrbitCenter::Spin => &[],
+        };
+        let center_slot = kinds.iter().find_map(|k| slots.iter().position(|s| s.metric.kind == *k));
+        Arrangement {
+            layout: self.layout,
+            ordering: self.ordering,
+            spacing: self.spacing,
+            distance_scale: self.distance_scale,
+            seed: self.seed.unwrap_or(0),
+            orbit: self.orbit_params(),
+            center_slot,
+        }
+    }
+
+    /// The background patterns' own settings.
+    pub fn pattern_shape(&self) -> PatternShape {
+        PatternShape {
+            ripple: self.bg_ripple,
+            drop_life: self.bg_drop_life,
+            wind: self.bg_wind,
+            chop: self.bg_chop,
+            julia_iter: self.bg_julia_iter,
+            julia_shape: self.bg_julia_shape,
+            carpet_levels: self.bg_carpet_levels,
+            octaves: self.bg_octaves,
+            roughness: self.bg_roughness,
+            sectors: self.bg_sectors,
+            dot_size: self.bg_dot_size,
+            dot_spacing: self.bg_dot_spacing,
+            dot_variability: self.bg_dot_variability,
+            invert_half: self.bg_invert_half,
+        }
+    }
+
     pub fn ground_params(&self) -> GroundParams {
         GroundParams {
             lum: self.bg_lum,
@@ -415,6 +577,9 @@ impl Config {
             rotate_period: self.bg_rotate_period,
             waves: self.bg_waves,
             wave_speed: self.bg_wave_speed,
+            drops: self.bg_drops,
+            seed: self.seed.unwrap_or(0),
+            shape: self.pattern_shape(),
         }
     }
 
@@ -441,8 +606,12 @@ impl Config {
         LegendParams { size: self.legend_size, opacity: self.legend_opacity, pos: self.legend_pos }
     }
 
-    /// Resolve `show`, `solids` and `rings` into slots. Errors are meant for the user.
+    /// Resolve `show`, `solids` and `rings` (or `bindings`) into slots.
+    /// Errors are meant for the user.
     pub fn resolve_slots(&self) -> Result<Vec<SlotSpec>, String> {
+        if !self.bindings.is_empty() {
+            return self.resolve_bindings();
+        }
         let mut specs: Vec<MetricSpec> = Vec::new();
         for s in &self.show {
             let spec = MetricSpec::parse(s)?;
@@ -482,9 +651,51 @@ impl Config {
             .map(|m| SlotSpec {
                 solid: lookup(&solids, &m).copied().unwrap_or(m.kind.default_solid()),
                 ring: lookup(&rings, &m).copied(),
+                inputs: Binding::of(m.clone()).inputs,
                 metric: m,
             })
             .collect())
+    }
+
+    /// Slots from `bindings`. An automatic shape is the primary metric's
+    /// own solid (or, with `solids` naming one for it, that), else the
+    /// first not yet taken; one driven by complexity starts at the simplest.
+    fn resolve_bindings(&self) -> Result<Vec<SlotSpec>, String> {
+        if self.bindings.len() > MAX_SOLIDS {
+            return Err(format!("at most {MAX_SOLIDS} solids can be bound (got {})", self.bindings.len()));
+        }
+        let bound: Vec<Binding> = self
+            .bindings
+            .iter()
+            .enumerate()
+            .map(|(i, b)| Binding::parse(b).map_err(|e| format!("binding {}: {e}", i + 1)))
+            .collect::<Result<_, _>>()?;
+        let mut used: Vec<SolidKind> = bound.iter().filter_map(|b| b.solid).collect();
+        let mut slots = Vec::new();
+        for b in bound {
+            let metric = b.primary().cloned().expect("a parsed binding has an input");
+            let solid = match b.solid {
+                Some(k) => k,
+                None if b.inputs[3].metric.is_some() => SolidKind::Tetrahedron,
+                None => {
+                    let wanted = self
+                        .solids
+                        .get(&metric.key())
+                        .or_else(|| self.solids.get(metric.kind.id()))
+                        .and_then(|id| SolidKind::from_id(id))
+                        .unwrap_or(metric.kind.default_solid());
+                    let k = if used.contains(&wanted) {
+                        SolidKind::ALL.into_iter().find(|k| !used.contains(k)).unwrap_or(wanted)
+                    } else {
+                        wanted
+                    };
+                    used.push(k);
+                    k
+                }
+            };
+            slots.push(SlotSpec { metric, solid, ring: None, inputs: b.inputs });
+        }
+        Ok(slots)
     }
 }
 
